@@ -53,8 +53,8 @@
     ];
     const THRESHOLD = 100000; 
     
-    // 換成比較不會阻擋前端的公共節點
-    const RPC_URL = "https://solana-rpc.publicnode.com"; 
+    // 換成你的專屬 Helius 節點
+    const RPC_URL = "https://mainnet.helius-rpc.com/?api-key=649f41dd-608c-4f76-aa98-338bf640a57a"; 
 
     let fetchErrorOccurred = false;
 
@@ -68,7 +68,7 @@
             return accounts.value.reduce((sum, acc) => sum + acc.account.data.parsed.info.tokenAmount.uiAmount, 0);
         } catch (e) {
             console.error("抓取資料失敗:", mintAddr, e);
-            fetchErrorOccurred = true; // 標記發生錯誤
+            fetchErrorOccurred = true; 
             return 0;
         }
     }
@@ -95,7 +95,6 @@
             const mainBalance = await getBalance(connection, walletPubKey, MAIN_TOKEN);
             
             let lpTotal = 0;
-            // 使用 Promise.all 加速抓取，避免一個一個等太久被節點斷線
             const lpPromises = LP_MINTS.map(lp => getBalance(connection, walletPubKey, lp));
             const lpResults = await Promise.all(lpPromises);
             lpTotal = lpResults.reduce((sum, val) => sum + val, 0);
