@@ -20,6 +20,7 @@
         .success { background-color: #e8f5e9; color: #2e7d32; }
         .fail { background-color: #ffebee; color: #c62828; }
         .loading { font-style: italic; color: #888; margin-top: 10px; }
+        .error-msg { color: #d32f2f; font-size: 12px; margin-top: 10px; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -27,9 +28,10 @@
 <div class="container">
     <h1>JMONEY 持有驗證器</h1>
     <input type="text" id="walletInput" placeholder="請貼上 Solana 錢包地址">
-    <button id="checkBtn" onclick="runVerify()">開始驗ional驗證</button>
+    <button id="checkBtn" onclick="runVerify()">開始驗證</button>
     
-    <div id="loadingMsg" class="loading" style="display: none;">正在掃描鏈上數據...</div>
+    <div id="loadingMsg" class="loading" style="display: none;">正在掃描鏈上數據，請稍候...</div>
+    <div id="errorBox" class="error-msg" style="display: none;">⚠️ 節點連線不穩定，部分資料抓取失敗。這通常是因為公共 RPC 限制，建議稍後再試。</div>
 
     <div id="result">
         <div id="tokenList"></div>
@@ -39,7 +41,6 @@
 </div>
 
 <script>
-    // --- 配置區域 ---
     const MAIN_TOKEN = "HZNnmhAY6xfq2iKRyBTEvTVeoTYJzpkK8mfnfG8Ppump";
     const LP_MINTS = [
         "6zscNVz9kKGqCKz4VE3qkbRRHu1vPKs7kbi6N5kZXxTD",
@@ -50,8 +51,12 @@
         "3HWMDUqkjp1WNA9Cho5g48z1tPFS8UzP4XqTibDkkcNX",
         "2oKmm3GhTg2c8qidoMxf5R5r1kaHr1nYP52jY7RuVbd1"
     ];
-    const THRESHOLD = 100000; // 你可以修改這裡的驗證門檻數值
-    const RPC_URL = "https://api.mainnet-beta.solana.com"; // 如果這太慢，請換成 Helius 等專屬 RPC
+    const THRESHOLD = 100000; 
+    
+    // 換成比較不會阻擋前端的公共節點
+    const RPC_URL = "https://solana-rpc.publicnode.com"; 
+
+    let fetchErrorOccurred = false;
 
     async function getBalance(connection, walletPubKey, mintAddr) {
         try {
@@ -60,10 +65,10 @@
                 { mint: new solanaWeb3.PublicKey(mintAddr) }
             );
             if (accounts.value.length === 0) return 0;
-            // 累加該錢包下所有同種類的 Token Account (預防使用者有多個帳戶)
             return accounts.value.reduce((sum, acc) => sum + acc.account.data.parsed.info.tokenAmount.uiAmount, 0);
         } catch (e) {
-            console.error("Error fetching balance for", mintAddr, e);
+            console.error("抓取資料失敗:", mintAddr, e);
+            fetchErrorOccurred = true; // 標記發生錯誤
             return 0;
         }
     }
@@ -72,30 +77,35 @@
         const walletStr = document.getElementById('walletInput').value.trim();
         if (!walletStr) return alert("請輸入地址");
 
-        // UI 狀態重置
         const btn = document.getElementById('checkBtn');
         const loader = document.getElementById('loadingMsg');
         const resultBox = document.getElementById('result');
+        const errorBox = document.getElementById('errorBox');
+        
         btn.disabled = true;
         loader.style.display = "block";
         resultBox.style.display = "none";
+        errorBox.style.display = "none";
+        fetchErrorOccurred = false;
 
         try {
-            const connection = new solanaWeb3.Connection(RPC_URL);
+            const connection = new solanaWeb3.Connection(RPC_URL, 'confirmed');
             const walletPubKey = new solanaWeb3.PublicKey(walletStr);
             
-            // 1. 查主代幣
             const mainBalance = await getBalance(connection, walletPubKey, MAIN_TOKEN);
             
-            // 2. 查所有 LP
             let lpTotal = 0;
-            for (const lp of LP_MINTS) {
-                lpTotal += await getBalance(connection, walletPubKey, lp);
-            }
+            // 使用 Promise.all 加速抓取，避免一個一個等太久被節點斷線
+            const lpPromises = LP_MINTS.map(lp => getBalance(connection, walletPubKey, lp));
+            const lpResults = await Promise.all(lpPromises);
+            lpTotal = lpResults.reduce((sum, val) => sum + val, 0);
 
             const finalTotal = mainBalance + lpTotal;
 
-            // 3. 渲染結果
+            if (fetchErrorOccurred) {
+                errorBox.style.display = "block";
+            }
+
             document.getElementById('tokenList').innerHTML = `
                 <div class="token-item"><span>主代幣 (JMONEY)</span> <span>${mainBalance.toLocaleString()}</span></div>
                 <div class="token-item"><span>Raydium LP 總計</span> <span>${lpTotal.toLocaleString()}</span></div>
@@ -103,8 +113,11 @@
             document.getElementById('totalAmount').innerText = finalTotal.toLocaleString();
             
             const statusBox = document.getElementById('statusBox');
-            if (finalTotal >= THRESHOLD) {
+            if (finalTotal >= THRESHOLD && !fetchErrorOccurred) {
                 statusBox.innerText = "✅ 驗證通過：符合持有門檻";
+                statusBox.className = "status success";
+            } else if (finalTotal >= THRESHOLD && fetchErrorOccurred) {
+                statusBox.innerText = "✅ 驗證通過 (但部分池子抓取失敗)";
                 statusBox.className = "status success";
             } else {
                 statusBox.innerText = `❌ 驗證失敗：低於門檻 ${THRESHOLD.toLocaleString()}`;
@@ -113,7 +126,7 @@
 
             resultBox.style.display = "block";
         } catch (err) {
-            alert("無效的錢包地址或網絡錯誤");
+            alert("無效的錢包地址格式！");
         } finally {
             btn.disabled = false;
             loader.style.display = "none";
