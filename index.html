@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JMONEY 持有量一鍵驗證</title>
+    <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); width: 100%; max-width: 450px; text-align: center; }
+        h1 { color: #333; font-size: 1.5rem; margin-bottom: 1.5rem; }
+        input { width: 100%; padding: 12px; margin-bottom: 1rem; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
+        button { width: 100%; padding: 12px; background-color: #512da8; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: bold; transition: 0.3s; }
+        button:hover { background-color: #673ab7; }
+        button:disabled { background-color: #ccc; }
+        #result { margin-top: 1.5rem; text-align: left; border-top: 1px solid #eee; padding-top: 1rem; display: none; }
+        .token-item { display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-size: 14px; color: #666; }
+        .total { font-weight: bold; color: #333; border-top: 1px solid #eee; padding-top: 0.5rem; margin-top: 0.5rem; font-size: 18px; }
+        .status { margin-top: 1rem; padding: 10px; border-radius: 6px; font-weight: bold; text-align: center; }
+        .success { background-color: #e8f5e9; color: #2e7d32; }
+        .fail { background-color: #ffebee; color: #c62828; }
+        .loading { font-style: italic; color: #888; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>JMONEY 持有驗證器</h1>
+    <input type="text" id="walletInput" placeholder="請貼上 Solana 錢包地址">
+    <button id="checkBtn" onclick="runVerify()">開始驗ional驗證</button>
+    
+    <div id="loadingMsg" class="loading" style="display: none;">正在掃描鏈上數據...</div>
+
+    <div id="result">
+        <div id="tokenList"></div>
+        <div class="total">總持有量: <span id="totalAmount">0</span></div>
+        <div id="statusBox" class="status"></div>
+    </div>
+</div>
+
+<script>
+    // --- 配置區域 ---
+    const MAIN_TOKEN = "HZNnmhAY6xfq2iKRyBTEvTVeoTYJzpkK8mfnfG8Ppump";
+    const LP_MINTS = [
+        "6zscNVz9kKGqCKz4VE3qkbRRHu1vPKs7kbi6N5kZXxTD",
+        "FEhXgzK83NoVNgvhHNretiwgWGVxNeUQvaPhwXthggfy",
+        "9nz42mpYCWQS5WcxwZpYfop7KsCrzk5vqXLWP15X2Xcq",
+        "4zA65gF4M69civXgdAQ2nmSAo2mGDRNEr3hTeBFdcRYN",
+        "DMXgYRVKxZPJxXYtLbxUFNVzdkYBZAjk3RLmNPXADmaC",
+        "3HWMDUqkjp1WNA9Cho5g48z1tPFS8UzP4XqTibDkkcNX",
+        "2oKmm3GhTg2c8qidoMxf5R5r1kaHr1nYP52jY7RuVbd1"
+    ];
+    const THRESHOLD = 100000; // 你可以修改這裡的驗證門檻數值
+    const RPC_URL = "https://api.mainnet-beta.solana.com"; // 如果這太慢，請換成 Helius 等專屬 RPC
+
+    async function getBalance(connection, walletPubKey, mintAddr) {
+        try {
+            const accounts = await connection.getParsedTokenAccountsByOwner(
+                walletPubKey,
+                { mint: new solanaWeb3.PublicKey(mintAddr) }
+            );
+            if (accounts.value.length === 0) return 0;
+            // 累加該錢包下所有同種類的 Token Account (預防使用者有多個帳戶)
+            return accounts.value.reduce((sum, acc) => sum + acc.account.data.parsed.info.tokenAmount.uiAmount, 0);
+        } catch (e) {
+            console.error("Error fetching balance for", mintAddr, e);
+            return 0;
+        }
+    }
+
+    async function runVerify() {
+        const walletStr = document.getElementById('walletInput').value.trim();
+        if (!walletStr) return alert("請輸入地址");
+
+        // UI 狀態重置
+        const btn = document.getElementById('checkBtn');
+        const loader = document.getElementById('loadingMsg');
+        const resultBox = document.getElementById('result');
+        btn.disabled = true;
+        loader.style.display = "block";
+        resultBox.style.display = "none";
+
+        try {
+            const connection = new solanaWeb3.Connection(RPC_URL);
+            const walletPubKey = new solanaWeb3.PublicKey(walletStr);
+            
+            // 1. 查主代幣
+            const mainBalance = await getBalance(connection, walletPubKey, MAIN_TOKEN);
+            
+            // 2. 查所有 LP
+            let lpTotal = 0;
+            for (const lp of LP_MINTS) {
+                lpTotal += await getBalance(connection, walletPubKey, lp);
+            }
+
+            const finalTotal = mainBalance + lpTotal;
+
+            // 3. 渲染結果
+            document.getElementById('tokenList').innerHTML = `
+                <div class="token-item"><span>主代幣 (JMONEY)</span> <span>${mainBalance.toLocaleString()}</span></div>
+                <div class="token-item"><span>Raydium LP 總計</span> <span>${lpTotal.toLocaleString()}</span></div>
+            `;
+            document.getElementById('totalAmount').innerText = finalTotal.toLocaleString();
+            
+            const statusBox = document.getElementById('statusBox');
+            if (finalTotal >= THRESHOLD) {
+                statusBox.innerText = "✅ 驗證通過：符合持有門檻";
+                statusBox.className = "status success";
+            } else {
+                statusBox.innerText = `❌ 驗證失敗：低於門檻 ${THRESHOLD.toLocaleString()}`;
+                statusBox.className = "status fail";
+            }
+
+            resultBox.style.display = "block";
+        } catch (err) {
+            alert("無效的錢包地址或網絡錯誤");
+        } finally {
+            btn.disabled = false;
+            loader.style.display = "none";
+        }
+    }
+</script>
+
+</body>
+</html>
