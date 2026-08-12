@@ -145,9 +145,9 @@
             <span class="token-box"><span class="coin dog">10K</span><span><span class="token-name">10K DOG</span><span class="address">C9HwNW…3pump</span></span></span>
           </label>
         </div>
-        <div class="notice show" id="jmoneyWarning" role="alert">
+        <div class="notice" id="jmoneyWarning" role="alert">
           <strong>⚠ JMONEY 防誤操作</strong><br>
-          正式 CA：HZNnmhAY6xfq2iKRyBTEvTVeoTYJzpkK8mfnfG8Ppump。執行前必須再次輸入「JMONEY」確認。系統只會關閉鏈上餘額為 0 的代幣帳戶；關閉空帳戶是回收 SOL 租金，不是燃燒其中的代幣。
+          你勾選的租金回收名單包含 JMONEY 帳戶。正式 CA：HZNnmhAY6xfq2iKRyBTEvTVeoTYJzpkK8mfnfG8Ppump。執行前必須再次輸入「JMONEY」確認。系統只會關閉鏈上餘額為 0 的代幣帳戶；關閉空帳戶是回收 SOL 租金，不是燃燒其中的代幣。
         </div>
       </section>
 
@@ -496,6 +496,7 @@
       function renderAccounts() {
         const list = $("accountList");
         list.replaceChildren();
+        $("jmoneyWarning").classList.remove("show");
         if (!state.accounts.length) {
           list.innerHTML = '<div class="empty">沒有找到可關閉的零餘額代幣帳戶。</div>';
           updateSummary();
@@ -529,7 +530,17 @@
               <span class="account-program">${account.programLabel} · ${shorten(account.pubkey, 6, 5)}</span>
             </span>
             <span class="rent">+${formatSol(account.lamports)}</span>`;
-          row.querySelector("input").addEventListener("change", () => {
+          row.querySelector("input").addEventListener("change", (event) => {
+            const selectedJmoney = selectedAccounts().some((item) => item.mint === JMONEY_MINT);
+            $("jmoneyWarning").classList.toggle("show", selectedJmoney);
+            if (event.currentTarget.checked && account.mint === JMONEY_MINT) {
+              alert(
+                `JMONEY 防誤操作提醒\n\n` +
+                `你剛勾選的租金回收帳戶屬於 JMONEY。\n\n` +
+                `正式 CA：\n${JMONEY_MINT}\n\n` +
+                `請確認你確實要關閉這個零餘額代幣帳戶。執行前還會要求輸入 JMONEY 再次確認。`
+              );
+            }
             updateSummary();
             scheduleSwapEstimate();
           });
@@ -966,14 +977,14 @@
         if (!accounts.length || state.busy) return;
         const grossLamports = accounts.reduce((sum, item) => sum + item.lamports, 0);
         const token = selectedToken();
-        if (token.value === JMONEY_MINT) {
-          const includesJmoneyAccount = accounts.some((account) => account.mint === JMONEY_MINT);
+        const includesJmoneyAccount = accounts.some((account) => account.mint === JMONEY_MINT);
+        if (includesJmoneyAccount) {
           const typed = window.prompt(
             `JMONEY 防誤操作確認\n\n` +
             `正式 CA：${JMONEY_MINT}\n` +
-            `${includesJmoneyAccount ? "你勾選的回收清單中包含 JMONEY 的零餘額代幣帳戶。該帳戶會被關閉後，在需要收幣時重新建立。\n\n" : ""}` +
+            `你勾選的回收清單中包含 JMONEY 的零餘額代幣帳戶。該帳戶將被關閉；若兌換目標是 JMONEY，收幣時會按需要重新建立。\n\n` +
             `本功能只關閉代幣餘額為 0 的帳戶並回收 SOL 租金，不會燃燒 JMONEY。\n\n` +
-            `若確認兌換目標是正式 JMONEY，請輸入：JMONEY`
+            `若確認要回收這個 JMONEY 帳戶的租金，請輸入：JMONEY`
           );
           if (typed === null) return;
           if (typed.trim().toUpperCase() !== "JMONEY") {
@@ -1089,11 +1100,6 @@
       });
       $("executeBtn").addEventListener("click", execute);
       document.querySelectorAll('input[name="target"]').forEach((input) => input.addEventListener("change", async () => {
-        const isJmoney = input.checked && input.value === JMONEY_MINT;
-        $("jmoneyWarning").classList.toggle("show", isJmoney);
-        if (isJmoney) {
-          alert(`JMONEY 防誤操作提醒\n\n請確認正式 CA：\n${JMONEY_MINT}\n\n執行時還會要求輸入 JMONEY 再次確認。`);
-        }
         updateSummary();
         if (state.publicKey) await refreshSwapRequirements();
       }));
