@@ -99,6 +99,7 @@
     details { margin-top: 16px; color: var(--muted); font-size: 12px; }
     details summary { cursor: pointer; }
     .rpc { width: 100%; margin-top: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 11px; color: var(--text); background: #06100c; }
+    .rpc-help { margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
     footer { padding-top: 18px; color: #61766b; text-align: center; font-size: 11px; }
     @media (max-width: 620px) {
       .page { padding-top: 25px; }
@@ -176,9 +177,10 @@
         <p class="fine-print">操作分為兩次錢包確認：先關閉你勾選的空帳戶，再將費用匯入公開冷錢包並兌換剩餘 SOL。任何一步取消都不會自動重試。</p>
         <div class="status" id="status" aria-live="polite"></div>
 
-        <details>
-          <summary>進階：自訂 Solana RPC</summary>
-          <input class="rpc" id="rpcInput" type="url" value="https://api.mainnet-beta.solana.com" aria-label="Solana RPC 網址">
+        <details id="rpcDetails">
+          <summary>進階：自訂 Solana RPC（遇到 403 時使用）</summary>
+          <input class="rpc" id="rpcInput" type="url" value="https://api.mainnet.solana.com" aria-label="Solana RPC 網址" autocomplete="off" spellcheck="false">
+          <p class="rpc-help">公共 RPC 可能限流或封鎖網站。正式發布時，請換成受網域限制的 Helius Secure URL，或其他專用 Solana RPC；不要把無限制的付費 API Key 公開在 GitHub。</p>
         </details>
       </section>
     </article>
@@ -344,6 +346,17 @@
           state.accounts.sort((a, b) => b.lamports - a.lamports);
           renderAccounts();
           log(`掃描完成：找到 ${state.accounts.length} 個可回收帳戶。`, "ok");
+        } catch (error) {
+          const message = String(error?.message || error);
+          if (/403|access forbidden|request blocked/i.test(message)) {
+            $("rpcDetails").open = true;
+            throw new Error("目前的 Solana RPC 拒絕存取（403）。請在下方換成你的專用 RPC 網址，再重新掃描；從 file:// 本機測試也可能被公共節點封鎖。");
+          }
+          if (/429|too many requests/i.test(message)) {
+            $("rpcDetails").open = true;
+            throw new Error("Solana RPC 請求過於頻繁（429）。請稍後重試，或換成專用 RPC 網址。");
+          }
+          throw error;
         } finally {
           setBusy(false);
         }
