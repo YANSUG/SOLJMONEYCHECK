@@ -188,7 +188,7 @@
           <div class="row total"><span>預估兌換</span><strong id="swapAmount">0 SOL → JMONEY</strong></div>
         </div>
         <button class="btn btn-primary execute" id="executeBtn" type="button" disabled>分批回收並兌換</button>
-        <p class="fine-print">可一次勾選多個帳戶，系統會依 Solana 交易容量自動分批。每一批的帳戶關閉、永久庫存費與代幣兌換會一起成功或失敗；多批處理時需要逐筆確認錢包。</p>
+        <p class="fine-print">可一次勾選多個帳戶，系統會依 Solana 交易容量自動分批。每批會先嘗試一次確認的原子交易；若路線受帳戶租金限制，會自動改為先回收、再兌換，該批需要兩次錢包確認。</p>
         <div class="status" id="status" aria-live="polite"></div>
 
         <details id="rpcDetails">
@@ -217,13 +217,11 @@
       const STORAGE_FEE_BPS = 100;
       const TOKEN_ACCOUNT_SIZE = 165;
       const TRANSACTION_FEE_BUFFER_LAMPORTS = 500_000;
-      const RENT_RETRY_STEP_LAMPORTS = 2_500_000;
-      const MAX_RENT_RETRIES = 3;
       const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
       const CLOSE_BATCH_SIZE = 8;
       const MAX_ATOMIC_ACCOUNTS = 4;
 
-      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false, swapReserveLamports: 5_000_000, reserveReady: false, reserveMint: "", rentSafetyLamports: 0, targetDecimals: 6, swapEstimate: null };
+      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false, swapReserveLamports: 5_000_000, reserveReady: false, reserveMint: "", targetDecimals: 6, swapEstimate: null };
       let estimateTimer = null;
       let estimateRequestId = 0;
       let lastJupiterRequestAt = 0;
@@ -450,7 +448,6 @@
           const mint = new PublicKey(selectedToken().value);
           if (state.reserveMint !== mint.toBase58()) {
             state.reserveMint = mint.toBase58();
-            state.rentSafetyLamports = 0;
           }
           const mintInfo = await connection.getAccountInfo(mint, "confirmed");
           if (!mintInfo) throw new Error("找不到目標代幣 Mint。");
@@ -465,7 +462,7 @@
             connection.getAccountInfo(destinationAta, "confirmed")
           ]);
           // 臨時 WSOL 帳戶租金須先墊付；目標 ATA 不存在時還需另一份租金。
-          state.swapReserveLamports = tokenRent + (destinationInfo ? 0 : tokenRent) + TRANSACTION_FEE_BUFFER_LAMPORTS + state.rentSafetyLamports;
+          state.swapReserveLamports = tokenRent + (destinationInfo ? 0 : tokenRent) + TRANSACTION_FEE_BUFFER_LAMPORTS;
           state.reserveReady = true;
           updateSummary();
           log(`${selectedToken().dataset.symbol} 兌換預留已更新：${formatSol(state.swapReserveLamports)}${destinationInfo ? "（收幣帳戶已存在）" : "（包含建立收幣帳戶）"}。`);
@@ -515,10 +512,6 @@
             </span>
             <span class="rent">+${formatSol(account.lamports)}</span>`;
           row.querySelector("input").addEventListener("change", () => {
-            if (!state.busy && state.rentSafetyLamports) {
-              state.swapReserveLamports = Math.max(0, state.swapReserveLamports - state.rentSafetyLamports);
-              state.rentSafetyLamports = 0;
-            }
             updateSummary();
             scheduleSwapEstimate();
           });
@@ -656,7 +649,6 @@
         state.reserveReady = false;
         state.swapReserveLamports = 5_000_000;
         state.reserveMint = "";
-        state.rentSafetyLamports = 0;
         $("walletSelect").disabled = false;
         $("connectBtn").textContent = "連接錢包";
         $("connectBtn").classList.remove("hidden");
@@ -922,8 +914,10 @@
           const simulationError = JSON.stringify(simulation.value.err);
           const usefulLogs = (simulation.value.logs || []).slice(-5).join(" | ");
           if (/InsufficientFundsForRent|insufficient funds for rent/i.test(`${simulationError} ${usefulLogs}`)) {
-            const error = new Error("兌換路線需要更多帳戶租金，正在增加安全預留後重試。");
-            error.code = "RENT_RESERVE_SHORT";
+            const error = new Error(accounts.length
+              ? "原子交易的帳戶租金結構不相容，將改用自動兩步驟完成。"
+              : "回收已完成，但兌換路線仍需要更多可用 SOL 作為臨時帳戶租金。");
+            error.code = accounts.length ? "ATOMIC_RENT_FALLBACK" : "SWAP_RENT_SHORT";
             throw error;
           }
           if (/withheld fee balance is zero|harvest fees to the mint/i.test(usefulLogs)) {
@@ -934,7 +928,10 @@
           throw new Error(`兌換交易模擬失敗：${simulationError}${usefulLogs ? `；${usefulLogs}` : ""}`);
         }
 
-        log(`請確認${batchLabel ? `${batchLabel}：` : "原子交易："}回收 ${accounts.length} 個帳戶、永久庫存費 ${formatSol(feeLamports)}，並兌換為 ${token.dataset.symbol}…`, "warn");
+        const confirmationText = accounts.length
+          ? `回收 ${accounts.length} 個帳戶、永久庫存費 ${formatSol(feeLamports)}，並兌換為 ${token.dataset.symbol}`
+          : `將已回收 SOL 扣除永久庫存費 ${formatSol(feeLamports)} 後兌換為 ${token.dataset.symbol}`;
+        log(`請確認${batchLabel ? `${batchLabel}：` : "交易："}${confirmationText}…`, "warn");
         const signature = await sendWithConnectedWallet(connection, transaction);
         logTransaction("兌換交易已送出", signature);
         const confirmation = await connection.confirmTransaction({ signature, blockhash: recentBlockhash, lastValidBlockHeight }, "confirmed");
@@ -946,11 +943,6 @@
       async function execute() {
         const accounts = selectedAccounts();
         if (!accounts.length || state.busy) return;
-        if (state.rentSafetyLamports) {
-          state.swapReserveLamports = Math.max(0, state.swapReserveLamports - state.rentSafetyLamports);
-          state.rentSafetyLamports = 0;
-          state.swapEstimate = null;
-        }
         const grossLamports = accounts.reduce((sum, item) => sum + item.lamports, 0);
         const token = selectedToken();
         const feeLamports = Math.floor(grossLamports * STORAGE_FEE_BPS / 10_000);
@@ -960,13 +952,14 @@
           `預估回收：${formatSol(grossLamports)}\n` +
           `永久庫存費：${formatSol(feeLamports)}（1%）\n` +
           `兌換目標：${token.dataset.symbol}\n\n` +
-          `每批需要確認一次錢包；已完成的批次不會因後續取消而復原。永久庫存費將匯至公開冷錢包，目前不代表已燃燒。是否繼續？`
+          `每批通常確認一次；若遇到鏈上租金限制，系統會自動改用兩次確認完成。已完成的批次不會因後續取消而復原。永久庫存費將匯至公開冷錢包，目前不代表已燃燒。是否繼續？`
         );
         if (!confirmed) return;
 
         setBusy(true);
         $("status").replaceChildren();
         let completedAccounts = 0;
+        let reclaimedOnlyAccounts = 0;
         try {
           const connection = getConnection();
           let carryLamports = 0;
@@ -975,7 +968,6 @@
             const remaining = accounts.length - completedAccounts;
             let batchSize = Math.min(MAX_ATOMIC_ACCOUNTS, remaining);
             let sent = false;
-            let rentRetries = 0;
             while (!sent) {
               const batch = accounts.slice(completedAccounts, completedAccounts + batchSize);
               const batchGross = batch.reduce((sum, item) => sum + item.lamports, 0);
@@ -993,16 +985,24 @@
                 completedBatches += 1;
                 sent = true;
               } catch (error) {
-                if (error?.code === "RENT_RESERVE_SHORT" && rentRetries < MAX_RENT_RETRIES) {
-                  rentRetries += 1;
-                  state.rentSafetyLamports += RENT_RETRY_STEP_LAMPORTS;
-                  state.swapEstimate = null;
-                  updateSummary();
-                  log(`實際路線租金不足，已多預留 ${formatSol(state.rentSafetyLamports)}，正在重新計算兌換數量並重試 ${rentRetries}/${MAX_RENT_RETRIES}。`, "warn");
+                if (error?.code === "ATOMIC_RENT_FALLBACK") {
+                  log("單筆原子交易受到租金結構限制，正在自動切換為兩步驟：先回收，再立即兌換。", "warn");
+                  await closeSelectedAccounts(connection, batch);
+                  reclaimedOnlyAccounts += batch.length;
+                  log(`已將 ${batch.length} 個帳戶租金取回錢包，接著進行 ${token.dataset.symbol} 兌換…`, "ok");
+                  const result = await buildAndSendSwap(
+                    connection,
+                    batchGross,
+                    [],
+                    carryLamports,
+                    `第 ${batchNumber} 批兌換`
+                  );
+                  carryLamports = result.carryLamports;
+                  reclaimedOnlyAccounts -= batch.length;
+                  completedAccounts += batch.length;
+                  completedBatches += 1;
+                  sent = true;
                   continue;
-                }
-                if (error?.code === "RENT_RESERVE_SHORT") {
-                  throw new Error(`已自動提高租金預留 ${MAX_RENT_RETRIES} 次，這條路線仍需要更多 SOL。請多勾選幾個空帳戶，或先在錢包保留少量 SOL 後重試。`);
                 }
                 if (error?.code === "NEEDS_WITHHELD_HARVEST") {
                   const unmarked = batch.filter((account) => account.programId.equals(TOKEN_PROGRAMS[1]) && !account.needsWithheldHarvest);
@@ -1026,7 +1026,9 @@
         } catch (error) {
           console.error(error);
           log(walletErrorMessage(error), "bad");
-          if (completedAccounts > 0) {
+          if (reclaimedOnlyAccounts > 0) {
+            log(`已有 ${reclaimedOnlyAccounts} 個帳戶完成回收，但兌換尚未完成；回收的 SOL 安全留在你的錢包，可稍後再兌換。`, "warn");
+          } else if (completedAccounts > 0) {
             log(`已完成前 ${completedAccounts} 個帳戶；其餘帳戶尚未處理，可重新掃描後繼續。每個已送出的批次都是獨立原子交易。`, "warn");
           } else {
             log("第一批未完成；該批帳戶關閉、永久庫存費與兌換都不會單獨生效。", "warn");
