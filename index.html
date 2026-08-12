@@ -217,11 +217,13 @@
       const STORAGE_FEE_BPS = 100;
       const TOKEN_ACCOUNT_SIZE = 165;
       const TRANSACTION_FEE_BUFFER_LAMPORTS = 500_000;
+      const RENT_RETRY_STEP_LAMPORTS = 2_500_000;
+      const MAX_RENT_RETRIES = 3;
       const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
       const CLOSE_BATCH_SIZE = 8;
       const MAX_ATOMIC_ACCOUNTS = 4;
 
-      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false, swapReserveLamports: 5_000_000, reserveReady: false, targetDecimals: 6, swapEstimate: null };
+      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false, swapReserveLamports: 5_000_000, reserveReady: false, reserveMint: "", rentSafetyLamports: 0, targetDecimals: 6, swapEstimate: null };
       let estimateTimer = null;
       let estimateRequestId = 0;
       const $ = (id) => document.getElementById(id);
@@ -389,6 +391,10 @@
         if (!state.publicKey) return;
         try {
           const mint = new PublicKey(selectedToken().value);
+          if (state.reserveMint !== mint.toBase58()) {
+            state.reserveMint = mint.toBase58();
+            state.rentSafetyLamports = 0;
+          }
           const mintInfo = await connection.getAccountInfo(mint, "confirmed");
           if (!mintInfo) throw new Error("找不到目標代幣 Mint。");
           state.targetDecimals = Number(mintInfo.data?.[44] ?? 6);
@@ -402,7 +408,7 @@
             connection.getAccountInfo(destinationAta, "confirmed")
           ]);
           // 臨時 WSOL 帳戶租金須先墊付；目標 ATA 不存在時還需另一份租金。
-          state.swapReserveLamports = tokenRent + (destinationInfo ? 0 : tokenRent) + TRANSACTION_FEE_BUFFER_LAMPORTS;
+          state.swapReserveLamports = tokenRent + (destinationInfo ? 0 : tokenRent) + TRANSACTION_FEE_BUFFER_LAMPORTS + state.rentSafetyLamports;
           state.reserveReady = true;
           updateSummary();
           log(`${selectedToken().dataset.symbol} 兌換預留已更新：${formatSol(state.swapReserveLamports)}${destinationInfo ? "（收幣帳戶已存在）" : "（包含建立收幣帳戶）"}。`);
@@ -588,6 +594,8 @@
         state.accounts = [];
         state.reserveReady = false;
         state.swapReserveLamports = 5_000_000;
+        state.reserveMint = "";
+        state.rentSafetyLamports = 0;
         $("walletSelect").disabled = false;
         $("connectBtn").textContent = "連接錢包";
         $("connectBtn").classList.remove("hidden");
@@ -850,13 +858,19 @@
           replaceRecentBlockhash: true
         });
         if (simulation.value.err) {
+          const simulationError = JSON.stringify(simulation.value.err);
           const usefulLogs = (simulation.value.logs || []).slice(-5).join(" | ");
+          if (/InsufficientFundsForRent|insufficient funds for rent/i.test(`${simulationError} ${usefulLogs}`)) {
+            const error = new Error("兌換路線需要更多帳戶租金，正在增加安全預留後重試。");
+            error.code = "RENT_RESERVE_SHORT";
+            throw error;
+          }
           if (/withheld fee balance is zero|harvest fees to the mint/i.test(usefulLogs)) {
             const error = new Error("偵測到 Token-2022 帳戶仍有代扣轉帳費，正在加入歸集指令後重試。");
             error.code = "NEEDS_WITHHELD_HARVEST";
             throw error;
           }
-          throw new Error(`兌換交易模擬失敗：${JSON.stringify(simulation.value.err)}${usefulLogs ? `；${usefulLogs}` : ""}`);
+          throw new Error(`兌換交易模擬失敗：${simulationError}${usefulLogs ? `；${usefulLogs}` : ""}`);
         }
 
         log(`請確認${batchLabel ? `${batchLabel}：` : "原子交易："}回收 ${accounts.length} 個帳戶、永久庫存費 ${formatSol(feeLamports)}，並兌換為 ${token.dataset.symbol}…`, "warn");
@@ -895,6 +909,7 @@
             const remaining = accounts.length - completedAccounts;
             let batchSize = Math.min(MAX_ATOMIC_ACCOUNTS, remaining);
             let sent = false;
+            let rentRetries = 0;
             while (!sent) {
               const batch = accounts.slice(completedAccounts, completedAccounts + batchSize);
               const batchGross = batch.reduce((sum, item) => sum + item.lamports, 0);
@@ -912,6 +927,17 @@
                 completedBatches += 1;
                 sent = true;
               } catch (error) {
+                if (error?.code === "RENT_RESERVE_SHORT" && rentRetries < MAX_RENT_RETRIES) {
+                  rentRetries += 1;
+                  state.rentSafetyLamports += RENT_RETRY_STEP_LAMPORTS;
+                  state.swapEstimate = null;
+                  updateSummary();
+                  log(`實際路線租金不足，已多預留 ${formatSol(state.rentSafetyLamports)}，正在重新計算兌換數量並重試 ${rentRetries}/${MAX_RENT_RETRIES}。`, "warn");
+                  continue;
+                }
+                if (error?.code === "RENT_RESERVE_SHORT") {
+                  throw new Error(`已自動提高租金預留 ${MAX_RENT_RETRIES} 次，這條路線仍需要更多 SOL。請多勾選幾個空帳戶，或先在錢包保留少量 SOL 後重試。`);
+                }
                 if (error?.code === "NEEDS_WITHHELD_HARVEST") {
                   const unmarked = batch.filter((account) => account.programId.equals(TOKEN_PROGRAMS[1]) && !account.hasTransferFeeAmount);
                   if (unmarked.length) {
