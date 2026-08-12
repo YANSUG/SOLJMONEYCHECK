@@ -187,8 +187,8 @@
           <div class="row"><span>兌換與帳戶建立預留</span><strong id="reserve">0 SOL</strong></div>
           <div class="row total"><span>預估兌換</span><strong id="swapAmount">0 SOL → JMONEY</strong></div>
         </div>
-        <button class="btn btn-primary execute" id="executeBtn" type="button" disabled>原子回收並兌換</button>
-        <p class="fine-print">一次錢包確認完成關閉空帳戶、永久庫存費與代幣兌換；整筆交易一起成功或一起失敗。受 Solana 交易大小限制，每次最多選擇 4 個帳戶。</p>
+        <button class="btn btn-primary execute" id="executeBtn" type="button" disabled>分批回收並兌換</button>
+        <p class="fine-print">可一次勾選多個帳戶，系統會依 Solana 交易容量自動分批。每一批的帳戶關閉、永久庫存費與代幣兌換會一起成功或失敗；多批處理時需要逐筆確認錢包。</p>
         <div class="status" id="status" aria-live="polite"></div>
 
         <details id="rpcDetails">
@@ -322,12 +322,13 @@
         const swap = Math.max(0, gross - storageFee - reserve);
         const token = selectedToken();
 
-        $("selectedCount").textContent = `${accounts.length} 個${accounts.length > MAX_ATOMIC_ACCOUNTS ? "（超過上限）" : ""}`;
+        const estimatedBatches = Math.ceil(accounts.length / MAX_ATOMIC_ACCOUNTS);
+        $("selectedCount").textContent = `${accounts.length} 個${estimatedBatches > 1 ? `（預計 ${estimatedBatches} 批以上）` : ""}`;
         $("grossRent").textContent = formatSol(gross);
         $("storageFee").textContent = formatSol(storageFee);
         $("reserve").textContent = `${formatSol(reserve)}${state.reserveReady ? "" : "（保守估算）"}`;
         $("swapAmount").textContent = `${formatSol(swap)} → ${token.dataset.symbol}`;
-        $("executeBtn").disabled = state.busy || !state.publicKey || accounts.length === 0 || accounts.length > MAX_ATOMIC_ACCOUNTS || swap <= 0;
+        $("executeBtn").disabled = state.busy || !state.publicKey || accounts.length === 0 || swap <= 0;
       }
 
       async function refreshSwapRequirements(connection = getConnection()) {
@@ -676,13 +677,14 @@
         }));
       }
 
-      async function buildAndSendSwap(connection, grossLamports, accounts) {
+      async function buildAndSendSwap(connection, grossLamports, accounts, carriedLamports = 0, batchLabel = "") {
         const feeLamports = Math.floor(grossLamports * STORAGE_FEE_BPS / 10_000);
         await refreshSwapRequirements(connection);
-        const swapLamports = grossLamports - feeLamports - state.swapReserveLamports;
+        const availableLamports = grossLamports + carriedLamports;
+        const swapLamports = availableLamports - feeLamports - state.swapReserveLamports;
         if (swapLamports <= 0) {
-          const shortage = Math.max(0, state.swapReserveLamports + feeLamports + 1 - grossLamports);
-          throw new Error(`本次回收金額不足以建立兌換所需帳戶。還需多回收約 ${formatSol(shortage)}；SOL 已留在你的錢包，可多選幾個空帳戶後再執行。`);
+          const shortage = Math.max(0, state.swapReserveLamports + feeLamports + 1 - availableLamports);
+          throw new Error(`第一批回收金額不足以建立兌換所需帳戶。還需多回收約 ${formatSol(shortage)}；請多選幾個空帳戶後再執行。`);
         }
 
         const token = selectedToken();
@@ -739,7 +741,9 @@
         try {
           if (transaction.serialize().length > 1232) throw new Error("too large");
         } catch {
-          throw new Error("這批帳戶與兌換路線超過 Solana 單筆交易大小限制，請減少勾選數量後重試。");
+          const error = new Error("這批帳戶與兌換路線超過 Solana 單筆交易大小限制。");
+          error.code = "TX_TOO_LARGE";
+          throw error;
         }
 
         const simulation = await connection.simulateTransaction(transaction, {
@@ -751,41 +755,78 @@
           throw new Error(`兌換交易模擬失敗：${JSON.stringify(simulation.value.err)}${usefulLogs ? `；${usefulLogs}` : ""}`);
         }
 
-        log(`請確認原子交易：回收 ${accounts.length} 個帳戶、永久庫存費 ${formatSol(feeLamports)}，並兌換為 ${token.dataset.symbol}…`, "warn");
+        log(`請確認${batchLabel ? `${batchLabel}：` : "原子交易："}回收 ${accounts.length} 個帳戶、永久庫存費 ${formatSol(feeLamports)}，並兌換為 ${token.dataset.symbol}…`, "warn");
         const signature = await sendWithConnectedWallet(connection, transaction);
         logTransaction("兌換交易已送出", signature);
         const confirmation = await connection.confirmTransaction({ signature, blockhash: recentBlockhash, lastValidBlockHeight }, "confirmed");
         if (confirmation.value.err) throw new Error(`兌換交易鏈上執行失敗：${JSON.stringify(confirmation.value.err)}`);
         log(`兌換完成，已確認收到 ${token.dataset.symbol}。`, "ok");
+        return { carryLamports: state.swapReserveLamports };
       }
 
       async function execute() {
         const accounts = selectedAccounts();
         if (!accounts.length || state.busy) return;
-        if (accounts.length > MAX_ATOMIC_ACCOUNTS) return alert(`每次最多選擇 ${MAX_ATOMIC_ACCOUNTS} 個帳戶，請分批操作。`);
         const grossLamports = accounts.reduce((sum, item) => sum + item.lamports, 0);
         const token = selectedToken();
         const feeLamports = Math.floor(grossLamports * STORAGE_FEE_BPS / 10_000);
+        const estimatedBatches = Math.ceil(accounts.length / MAX_ATOMIC_ACCOUNTS);
         const confirmed = window.confirm(
-          `即將用一筆原子交易關閉 ${accounts.length} 個零餘額帳戶並直接兌換。\n\n` +
+          `即將關閉 ${accounts.length} 個零餘額帳戶並直接兌換，預計分成 ${estimatedBatches} 批以上。\n\n` +
           `預估回收：${formatSol(grossLamports)}\n` +
           `永久庫存費：${formatSol(feeLamports)}（1%）\n` +
           `兌換目標：${token.dataset.symbol}\n\n` +
-          `永久庫存費將匯至公開冷錢包；目前不代表已燃燒。是否繼續？`
+          `每批需要確認一次錢包；已完成的批次不會因後續取消而復原。永久庫存費將匯至公開冷錢包，目前不代表已燃燒。是否繼續？`
         );
         if (!confirmed) return;
 
         setBusy(true);
         $("status").replaceChildren();
+        let completedAccounts = 0;
         try {
           const connection = getConnection();
-          await buildAndSendSwap(connection, grossLamports, accounts);
-          log("原子回收與兌換全部完成。你可以重新掃描確認結果。", "ok");
+          let carryLamports = 0;
+          let completedBatches = 0;
+          while (completedAccounts < accounts.length) {
+            const remaining = accounts.length - completedAccounts;
+            let batchSize = Math.min(MAX_ATOMIC_ACCOUNTS, remaining);
+            let sent = false;
+            while (!sent) {
+              const batch = accounts.slice(completedAccounts, completedAccounts + batchSize);
+              const batchGross = batch.reduce((sum, item) => sum + item.lamports, 0);
+              const batchNumber = completedBatches + 1;
+              try {
+                const result = await buildAndSendSwap(
+                  connection,
+                  batchGross,
+                  batch,
+                  carryLamports,
+                  `第 ${batchNumber} 批（尚餘 ${remaining} 個）`
+                );
+                carryLamports = result.carryLamports;
+                completedAccounts += batch.length;
+                completedBatches += 1;
+                sent = true;
+              } catch (error) {
+                if (error?.code === "TX_TOO_LARGE" && batchSize > 1) {
+                  batchSize -= 1;
+                  log(`本批交易容量過大，已自動縮小為 ${batchSize} 個帳戶後重試，不需重新勾選。`, "warn");
+                  continue;
+                }
+                throw error;
+              }
+            }
+          }
+          log(`全部完成：已分批回收並兌換 ${completedAccounts} 個帳戶。你可以重新掃描確認結果。`, "ok");
           await scanAccounts();
         } catch (error) {
           console.error(error);
           log(walletErrorMessage(error), "bad");
-          log("這是原子交易：若鏈上執行失敗，帳戶關閉、永久庫存費與兌換都不會單獨生效。", "warn");
+          if (completedAccounts > 0) {
+            log(`已完成前 ${completedAccounts} 個帳戶；其餘帳戶尚未處理，可重新掃描後繼續。每個已送出的批次都是獨立原子交易。`, "warn");
+          } else {
+            log("第一批未完成；該批帳戶關閉、永久庫存費與兌換都不會單獨生效。", "warn");
+          }
         } finally {
           setBusy(false);
         }
@@ -817,6 +858,5 @@
   </script>
 </body>
 </html>
-
 
 
