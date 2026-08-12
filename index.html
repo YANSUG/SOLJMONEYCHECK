@@ -57,7 +57,8 @@
     .coin.dog { background: linear-gradient(145deg, #a6ffe0, #29c780); }
     .token-name { font-weight: 850; }
     .address { margin-top: 5px; color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
-    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .hidden { display: none !important; }
     .wallet-picker { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-bottom: 10px; }
     .wallet-select { min-width: 0; min-height: 50px; padding: 0 42px 0 15px; border: 1px solid var(--line); border-radius: 15px; color: var(--text); background: var(--panel-2); cursor: pointer; }
     .wallet-select:focus-visible { outline: 3px solid rgba(92, 242, 165, .4); outline-offset: 2px; }
@@ -161,6 +162,7 @@
         <div class="actions">
           <button class="btn btn-primary" id="connectBtn" type="button">連接錢包</button>
           <button class="btn btn-secondary" id="scanBtn" type="button" disabled>掃描空帳戶</button>
+          <button class="btn btn-secondary hidden" id="switchBtn" type="button">更換帳戶／錢包</button>
         </div>
         <div class="wallet" id="walletStatus" aria-live="polite"></div>
       </section>
@@ -185,8 +187,8 @@
           <div class="row"><span>兌換與帳戶建立預留</span><strong id="reserve">0 SOL</strong></div>
           <div class="row total"><span>預估兌換</span><strong id="swapAmount">0 SOL → JMONEY</strong></div>
         </div>
-        <button class="btn btn-primary execute" id="executeBtn" type="button" disabled>回收租金並兌換</button>
-        <p class="fine-print">操作分為兩次錢包確認：先關閉你勾選的空帳戶，再將費用匯入公開冷錢包並兌換剩餘 SOL。任何一步取消都不會自動重試。</p>
+        <button class="btn btn-primary execute" id="executeBtn" type="button" disabled>原子回收並兌換</button>
+        <p class="fine-print">一次錢包確認完成關閉空帳戶、永久庫存費與代幣兌換；整筆交易一起成功或一起失敗。受 Solana 交易大小限制，每次最多選擇 4 個帳戶。</p>
         <div class="status" id="status" aria-live="polite"></div>
 
         <details id="rpcDetails">
@@ -213,10 +215,13 @@
       const BUILTIN_RPC = "https://mainnet.helius-rpc.com/?api-key=649f41dd-608c-4f76-aa98-338bf640a57a";
       const COLD_WALLET = new PublicKey("BLD4tSvkhKg9YQPZLBB5AZXY5VaNNgfPffyeAaCejDBq");
       const STORAGE_FEE_BPS = 100;
-      const SWAP_RESERVE_LAMPORTS = 3_000_000;
+      const TOKEN_ACCOUNT_SIZE = 165;
+      const TRANSACTION_FEE_BUFFER_LAMPORTS = 500_000;
+      const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
       const CLOSE_BATCH_SIZE = 8;
+      const MAX_ATOMIC_ACCOUNTS = 4;
 
-      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false };
+      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false, swapReserveLamports: 5_000_000, reserveReady: false };
       const $ = (id) => document.getElementById(id);
       const formatSol = (lamports) => `${(Number(lamports) / 1e9).toFixed(6)} SOL`;
       const shorten = (value, left = 6, right = 5) => `${value.slice(0, left)}…${value.slice(-right)}`;
@@ -228,6 +233,7 @@
         state.busy = value;
         $("connectBtn").disabled = value;
         $("scanBtn").disabled = value || !state.publicKey;
+        $("switchBtn").disabled = value;
         updateSummary();
       }
 
@@ -312,16 +318,44 @@
         const accounts = selectedAccounts();
         const gross = accounts.reduce((sum, item) => sum + item.lamports, 0);
         const storageFee = Math.floor(gross * STORAGE_FEE_BPS / 10_000);
-        const reserve = gross ? Math.min(SWAP_RESERVE_LAMPORTS, Math.max(0, gross - storageFee)) : 0;
+        const reserve = gross ? Math.min(state.swapReserveLamports, Math.max(0, gross - storageFee)) : 0;
         const swap = Math.max(0, gross - storageFee - reserve);
         const token = selectedToken();
 
-        $("selectedCount").textContent = `${accounts.length} 個`;
+        $("selectedCount").textContent = `${accounts.length} 個${accounts.length > MAX_ATOMIC_ACCOUNTS ? "（超過上限）" : ""}`;
         $("grossRent").textContent = formatSol(gross);
         $("storageFee").textContent = formatSol(storageFee);
-        $("reserve").textContent = formatSol(reserve);
+        $("reserve").textContent = `${formatSol(reserve)}${state.reserveReady ? "" : "（保守估算）"}`;
         $("swapAmount").textContent = `${formatSol(swap)} → ${token.dataset.symbol}`;
-        $("executeBtn").disabled = state.busy || !state.publicKey || accounts.length === 0 || swap <= 0;
+        $("executeBtn").disabled = state.busy || !state.publicKey || accounts.length === 0 || accounts.length > MAX_ATOMIC_ACCOUNTS || swap <= 0;
+      }
+
+      async function refreshSwapRequirements(connection = getConnection()) {
+        if (!state.publicKey) return;
+        try {
+          const mint = new PublicKey(selectedToken().value);
+          const mintInfo = await connection.getAccountInfo(mint, "confirmed");
+          if (!mintInfo) throw new Error("找不到目標代幣 Mint。");
+          const tokenProgram = mintInfo.owner;
+          const [destinationAta] = PublicKey.findProgramAddressSync(
+            [state.publicKey.toBuffer(), tokenProgram.toBuffer(), mint.toBuffer()],
+            ASSOCIATED_TOKEN_PROGRAM_ID
+          );
+          const [tokenRent, destinationInfo] = await Promise.all([
+            connection.getMinimumBalanceForRentExemption(TOKEN_ACCOUNT_SIZE),
+            connection.getAccountInfo(destinationAta, "confirmed")
+          ]);
+          // 臨時 WSOL 帳戶租金須先墊付；目標 ATA 不存在時還需另一份租金。
+          state.swapReserveLamports = tokenRent + (destinationInfo ? 0 : tokenRent) + TRANSACTION_FEE_BUFFER_LAMPORTS;
+          state.reserveReady = true;
+          updateSummary();
+          log(`${selectedToken().dataset.symbol} 兌換預留已更新：${formatSol(state.swapReserveLamports)}${destinationInfo ? "（收幣帳戶已存在）" : "（包含建立收幣帳戶）"}。`);
+        } catch (error) {
+          state.swapReserveLamports = 5_000_000;
+          state.reserveReady = false;
+          updateSummary();
+          log(`無法取得即時帳戶租金，改用保守預留：${walletErrorMessage(error)}`, "warn");
+        }
       }
 
       function renderAccounts() {
@@ -462,11 +496,59 @@
         $("walletStatus").textContent = `${chosen.name} 已連接 ${state.publicKey.toBase58()}`;
         $("walletStatus").classList.add("show");
         $("connectBtn").textContent = `${chosen.name} 已連接`;
+        $("connectBtn").classList.add("hidden");
+        $("switchBtn").classList.remove("hidden");
         $("walletSelect").disabled = true;
         $("scanBtn").disabled = false;
-        chosen.provider.on?.("accountChanged", () => window.location.reload());
-        chosen.provider.on?.("disconnect", () => window.location.reload());
+        chosen.provider.on?.("accountChanged", async (nextPublicKey) => {
+          if (state.wallet !== chosen.provider) return;
+          if (!nextPublicKey) return resetWalletUi("錢包帳戶已中斷連線。");
+          try {
+            state.publicKey = nextPublicKey?.toBase58 ? nextPublicKey : new PublicKey(String(nextPublicKey));
+            state.accounts = [];
+            renderAccounts();
+            $("walletStatus").textContent = `${chosen.name} 已切換至 ${state.publicKey.toBase58()}`;
+            log(`${chosen.name} 已切換帳戶，請重新掃描。`, "ok");
+            await refreshSwapRequirements();
+          } catch (error) {
+            log(`切換帳戶失敗：${walletErrorMessage(error)}`, "bad");
+          }
+        });
+        chosen.provider.on?.("disconnect", () => {
+          if (state.wallet === chosen.provider) resetWalletUi("錢包已中斷連線。");
+        });
         log(`${chosen.name} 連接成功。`, "ok");
+        await refreshSwapRequirements();
+      }
+
+      function resetWalletUi(message = "") {
+        state.wallet = null;
+        state.walletName = "";
+        state.publicKey = null;
+        state.accounts = [];
+        state.reserveReady = false;
+        state.swapReserveLamports = 5_000_000;
+        $("walletSelect").disabled = false;
+        $("connectBtn").textContent = "連接錢包";
+        $("connectBtn").classList.remove("hidden");
+        $("switchBtn").classList.add("hidden");
+        $("scanBtn").disabled = true;
+        $("walletStatus").classList.remove("show");
+        $("walletStatus").textContent = "";
+        renderAccounts();
+        if (message) log(message, "warn");
+      }
+
+      async function disconnectWallet() {
+        const provider = state.wallet;
+        if (!provider) return resetWalletUi();
+        try {
+          await provider.disconnect?.();
+        } catch (error) {
+          log(`錢包未回應中斷請求：${walletErrorMessage(error)}`, "warn");
+        } finally {
+          resetWalletUi("已清除目前帳戶，請重新選擇錢包並連接其他地址。");
+        }
       }
 
       async function scanAccounts() {
@@ -594,10 +676,14 @@
         }));
       }
 
-      async function buildAndSendSwap(connection, grossLamports) {
+      async function buildAndSendSwap(connection, grossLamports, accounts) {
         const feeLamports = Math.floor(grossLamports * STORAGE_FEE_BPS / 10_000);
-        const swapLamports = grossLamports - feeLamports - SWAP_RESERVE_LAMPORTS;
-        if (swapLamports <= 0) throw new Error("回收金額不足以保留交易成本並進行兌換。");
+        await refreshSwapRequirements(connection);
+        const swapLamports = grossLamports - feeLamports - state.swapReserveLamports;
+        if (swapLamports <= 0) {
+          const shortage = Math.max(0, state.swapReserveLamports + feeLamports + 1 - grossLamports);
+          throw new Error(`本次回收金額不足以建立兌換所需帳戶。還需多回收約 ${formatSol(shortage)}；SOL 已留在你的錢包，可多選幾個空帳戶後再執行。`);
+        }
 
         const token = selectedToken();
         const params = new URLSearchParams({
@@ -622,6 +708,7 @@
         const instructions = [
           ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
           ...(build.computeBudgetInstructions || []).map(toInstruction),
+          ...accounts.map(closeAccountInstruction),
           ...(build.setupInstructions || []).map(toInstruction),
           toInstruction(build.swapInstruction),
           transferFee,
@@ -649,6 +736,11 @@
           instructions
         }).compileToV0Message(makeLookupTables(build.addressesByLookupTableAddress));
         const transaction = new VersionedTransaction(message);
+        try {
+          if (transaction.serialize().length > 1232) throw new Error("too large");
+        } catch {
+          throw new Error("這批帳戶與兌換路線超過 Solana 單筆交易大小限制，請減少勾選數量後重試。");
+        }
 
         const simulation = await connection.simulateTransaction(transaction, {
           sigVerify: false,
@@ -659,7 +751,7 @@
           throw new Error(`兌換交易模擬失敗：${JSON.stringify(simulation.value.err)}${usefulLogs ? `；${usefulLogs}` : ""}`);
         }
 
-        log(`請確認永久庫存費 ${formatSol(feeLamports)} 與兌換交易…`, "warn");
+        log(`請確認原子交易：回收 ${accounts.length} 個帳戶、永久庫存費 ${formatSol(feeLamports)}，並兌換為 ${token.dataset.symbol}…`, "warn");
         const signature = await sendWithConnectedWallet(connection, transaction);
         logTransaction("兌換交易已送出", signature);
         const confirmation = await connection.confirmTransaction({ signature, blockhash: recentBlockhash, lastValidBlockHeight }, "confirmed");
@@ -670,11 +762,12 @@
       async function execute() {
         const accounts = selectedAccounts();
         if (!accounts.length || state.busy) return;
+        if (accounts.length > MAX_ATOMIC_ACCOUNTS) return alert(`每次最多選擇 ${MAX_ATOMIC_ACCOUNTS} 個帳戶，請分批操作。`);
         const grossLamports = accounts.reduce((sum, item) => sum + item.lamports, 0);
         const token = selectedToken();
         const feeLamports = Math.floor(grossLamports * STORAGE_FEE_BPS / 10_000);
         const confirmed = window.confirm(
-          `即將關閉 ${accounts.length} 個零餘額帳戶。\n\n` +
+          `即將用一筆原子交易關閉 ${accounts.length} 個零餘額帳戶並直接兌換。\n\n` +
           `預估回收：${formatSol(grossLamports)}\n` +
           `永久庫存費：${formatSol(feeLamports)}（1%）\n` +
           `兌換目標：${token.dataset.symbol}\n\n` +
@@ -686,14 +779,13 @@
         $("status").replaceChildren();
         try {
           const connection = getConnection();
-          await closeSelectedAccounts(connection, accounts);
-          await buildAndSendSwap(connection, grossLamports);
-          log("全部完成。你可以重新掃描確認結果。", "ok");
+          await buildAndSendSwap(connection, grossLamports, accounts);
+          log("原子回收與兌換全部完成。你可以重新掃描確認結果。", "ok");
           await scanAccounts();
         } catch (error) {
           console.error(error);
           log(walletErrorMessage(error), "bad");
-          log("若租金回收已確認但兌換未完成，回收的 SOL 仍留在你的錢包中。", "warn");
+          log("這是原子交易：若鏈上執行失敗，帳戶關閉、永久庫存費與兌換都不會單獨生效。", "warn");
         } finally {
           setBusy(false);
         }
@@ -705,8 +797,16 @@
         finally { setBusy(false); }
       });
       $("scanBtn").addEventListener("click", () => scanAccounts().catch((error) => log(error.message, "bad")));
+      $("switchBtn").addEventListener("click", async () => {
+        setBusy(true);
+        try { await disconnectWallet(); }
+        finally { setBusy(false); }
+      });
       $("executeBtn").addEventListener("click", execute);
-      document.querySelectorAll('input[name="target"]').forEach((input) => input.addEventListener("change", updateSummary));
+      document.querySelectorAll('input[name="target"]').forEach((input) => input.addEventListener("change", async () => {
+        updateSummary();
+        if (state.publicKey) await refreshSwapRequirements();
+      }));
       $("feeInfoBtn").addEventListener("click", () => {
         const notice = $("feeNotice");
         const open = notice.classList.toggle("show");
@@ -717,5 +817,6 @@
   </script>
 </body>
 </html>
+
 
 
