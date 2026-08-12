@@ -76,8 +76,14 @@
     .account { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 11px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(0,0,0,.12); }
     .account input { width: 18px; height: 18px; accent-color: var(--green-2); }
     .account-main { min-width: 0; }
+    .account-name { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 13px; font-weight: 800; }
+    .account-name-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .account-symbol { flex: 0 0 auto; padding: 2px 6px; border-radius: 999px; color: var(--green); background: rgba(92,242,165,.09); font-size: 9px; font-weight: 850; }
+    .account-meta { display: flex; align-items: center; gap: 7px; min-width: 0; margin-top: 5px; }
     .account-mint { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
-    .account-program { margin-top: 3px; color: var(--muted); font-size: 10px; }
+    .account-program { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; }
+    .copy-ca { flex: 0 0 auto; padding: 3px 7px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: rgba(255,255,255,.035); cursor: pointer; font-size: 9px; }
+    .copy-ca:hover { color: var(--text); border-color: rgba(92,242,165,.35); }
     .rent { color: var(--green); font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
     .summary { display: grid; gap: 12px; }
     .row { display: flex; justify-content: space-between; gap: 18px; color: var(--muted); font-size: 13px; }
@@ -210,6 +216,7 @@
       const shorten = (value, left = 6, right = 5) => `${value.slice(0, left)}…${value.slice(-right)}`;
       const selectedToken = () => document.querySelector('input[name="target"]:checked');
       const selectedAccounts = () => state.accounts.filter((_, i) => document.getElementById(`account-${i}`)?.checked);
+      const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
 
       function setBusy(value) {
         state.busy = value;
@@ -259,19 +266,82 @@
           return;
         }
         state.accounts.forEach((account, index) => {
-          const row = document.createElement("label");
+          const displayName = account.name || "未知代幣";
+          const symbol = account.symbol && account.symbol.toLowerCase() !== displayName.toLowerCase() ? account.symbol : "";
+          const row = document.createElement("div");
           row.className = "account";
           row.innerHTML = `
-            <input id="account-${index}" type="checkbox" checked>
+            <input id="account-${index}" type="checkbox" checked aria-label="選擇 ${escapeHtml(displayName)}">
             <span class="account-main">
-              <span class="account-mint" title="${account.mint}">${shorten(account.mint, 9, 7)}</span>
+              <span class="account-name" title="${escapeHtml(displayName)}">
+                <span class="account-name-text">${escapeHtml(displayName)}</span>
+                ${symbol ? `<span class="account-symbol">${escapeHtml(symbol)}</span>` : ""}
+              </span>
+              <span class="account-meta">
+                <span class="account-mint" title="${account.mint}">CA ${shorten(account.mint, 7, 6)}</span>
+                <button class="copy-ca" type="button" data-mint="${account.mint}" aria-label="複製 ${escapeHtml(displayName)} 的 CA">複製 CA</button>
+              </span>
               <span class="account-program">${account.programLabel} · ${shorten(account.pubkey, 6, 5)}</span>
             </span>
             <span class="rent">+${formatSol(account.lamports)}</span>`;
           row.querySelector("input").addEventListener("change", updateSummary);
+          row.querySelector(".copy-ca").addEventListener("click", async (event) => {
+            const button = event.currentTarget;
+            try {
+              await copyText(button.dataset.mint);
+              button.textContent = "已複製";
+              setTimeout(() => { button.textContent = "複製 CA"; }, 1200);
+            } catch {
+              log("無法自動複製，請從 CA 提示中手動複製。", "warn");
+            }
+          });
           list.appendChild(row);
         });
         updateSummary();
+      }
+
+      async function copyText(value) {
+        if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(value);
+        const input = document.createElement("textarea");
+        input.value = value;
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        const copied = document.execCommand("copy");
+        input.remove();
+        if (!copied) throw new Error("Copy failed");
+      }
+
+      async function hydrateTokenMetadata(endpoint) {
+        const mints = [...new Set(state.accounts.map((account) => account.mint))];
+        if (!mints.length) return;
+        log(`正在辨識 ${mints.length} 種代幣名稱…`);
+        try {
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: "token-metadata",
+              method: "getAssetBatch",
+              params: { ids: mints }
+            })
+          });
+          const payload = await response.json();
+          if (!response.ok || payload.error) throw new Error(payload.error?.message || `HTTP ${response.status}`);
+          const metadataByMint = new Map((payload.result || []).filter(Boolean).map((asset) => {
+            const metadata = asset.content?.metadata || {};
+            return [asset.id, {
+              name: String(metadata.name || asset.token_info?.symbol || "").trim(),
+              symbol: String(metadata.symbol || asset.token_info?.symbol || "").trim()
+            }];
+          }));
+          state.accounts.forEach((account) => Object.assign(account, metadataByMint.get(account.mint) || {}));
+          log(`已辨識 ${[...metadataByMint.values()].filter((item) => item.name).length} 種代幣。`, "ok");
+        } catch (error) {
+          log(`代幣名稱暫時無法取得，仍可依 CA 核對：${error.message}`, "warn");
+        }
       }
 
       function installedWallets() {
@@ -346,6 +416,7 @@
             }
           }
           state.accounts.sort((a, b) => b.lamports - a.lamports);
+          await hydrateTokenMetadata(connection.rpcEndpoint);
           renderAccounts();
           log(`掃描完成：找到 ${state.accounts.length} 個可回收帳戶。`, "ok");
         } catch (error) {
@@ -535,6 +606,5 @@
   </script>
 </body>
 </html>
-
 
 
