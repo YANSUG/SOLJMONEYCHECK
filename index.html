@@ -72,6 +72,11 @@
     .wallet { display: none; margin-top: 12px; padding: 10px 12px; color: var(--green); border: 1px solid rgba(92,242,165,.18); border-radius: 12px; background: rgba(92,242,165,.06); font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
     .wallet.show { display: block; }
     .list { display: grid; gap: 8px; max-height: 285px; overflow: auto; scrollbar-color: #315d49 transparent; }
+    .account-group { display: grid; gap: 8px; }
+    .account-group + .account-group { margin-top: 10px; padding-top: 13px; border-top: 1px solid var(--line); }
+    .group-heading { position: sticky; top: 0; z-index: 2; display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border-radius: 10px; color: var(--text); background: rgba(11, 27, 21, .96); backdrop-filter: blur(8px); font-size: 11px; font-weight: 850; }
+    .group-heading span:last-child { color: var(--muted); font-weight: 700; }
+    .group-heading.unknown { color: var(--amber); }
     .empty { padding: 28px 18px; border: 1px dashed var(--line); border-radius: 16px; color: var(--muted); text-align: center; line-height: 1.6; }
     .account { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 11px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(0,0,0,.12); }
     .account input { width: 18px; height: 18px; accent-color: var(--green-2); }
@@ -265,13 +270,22 @@
           updateSummary();
           return;
         }
-        state.accounts.forEach((account, index) => {
+        const groups = [
+          { title: "有名稱的代幣", className: "", accounts: state.accounts.map((account, index) => ({ account, index })).filter(({ account }) => Boolean(account.name)) },
+          { title: "未知代幣", className: "unknown", accounts: state.accounts.map((account, index) => ({ account, index })).filter(({ account }) => !account.name) }
+        ];
+        groups.forEach((group) => {
+          if (!group.accounts.length) return;
+          const section = document.createElement("section");
+          section.className = "account-group";
+          section.innerHTML = `<div class="group-heading ${group.className}"><span>${group.title}</span><span>${group.accounts.length} 個帳戶</span></div>`;
+          group.accounts.forEach(({ account, index }) => {
           const displayName = account.name || "未知代幣";
           const symbol = account.symbol && account.symbol.toLowerCase() !== displayName.toLowerCase() ? account.symbol : "";
           const row = document.createElement("div");
           row.className = "account";
           row.innerHTML = `
-            <input id="account-${index}" type="checkbox" checked aria-label="選擇 ${escapeHtml(displayName)}">
+            <input id="account-${index}" type="checkbox" aria-label="選擇 ${escapeHtml(displayName)}">
             <span class="account-main">
               <span class="account-name" title="${escapeHtml(displayName)}">
                 <span class="account-name-text">${escapeHtml(displayName)}</span>
@@ -295,7 +309,9 @@
               log("無法自動複製，請從 CA 提示中手動複製。", "warn");
             }
           });
-          list.appendChild(row);
+            section.appendChild(row);
+          });
+          list.appendChild(section);
         });
         updateSummary();
       }
