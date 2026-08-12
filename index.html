@@ -184,6 +184,7 @@
             此費用將以 SOL 匯入公開冷錢包統一保管，未來可能用於永久流動性、代幣回購或鏈上燃燒。現階段不代表代幣已燃燒，也不保證資產無法取回。
             <span class="cold-wallet">BLD4tSvkhKg9YQPZLBB5AZXY5VaNNgfPffyeAaCejDBq</span>
           </div>
+          <div class="row" id="coldWalletActivationRow"><span>冷錢包首次啟用補足</span><strong id="coldWalletActivation">檢查中</strong></div>
           <div class="row"><span>兌換與帳戶建立預留</span><strong id="reserve">0 SOL</strong></div>
           <div class="row total"><span>預估兌換</span><strong id="swapAmount">0 SOL → JMONEY</strong></div>
         </div>
@@ -221,7 +222,7 @@
       const CLOSE_BATCH_SIZE = 8;
       const MAX_ATOMIC_ACCOUNTS = 4;
 
-      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false, swapReserveLamports: 5_000_000, reserveReady: false, reserveMint: "", targetDecimals: 6, swapEstimate: null };
+      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false, swapReserveLamports: 5_000_000, reserveReady: false, reserveMint: "", coldWalletActivationLamports: 0, coldWalletReady: false, targetDecimals: 6, swapEstimate: null };
       let estimateTimer = null;
       let estimateRequestId = 0;
       let lastJupiterRequestAt = 0;
@@ -383,14 +384,18 @@
         const accounts = selectedAccounts();
         const gross = accounts.reduce((sum, item) => sum + item.lamports, 0);
         const storageFee = Math.floor(gross * STORAGE_FEE_BPS / 10_000);
+        const coldWalletActivation = gross ? state.coldWalletActivationLamports : 0;
         const reserve = gross ? Math.min(state.swapReserveLamports, Math.max(0, gross - storageFee)) : 0;
-        const swap = Math.max(0, gross - storageFee - reserve);
+        const swap = Math.max(0, gross - storageFee - coldWalletActivation - reserve);
         const token = selectedToken();
 
         const estimatedBatches = Math.ceil(accounts.length / MAX_ATOMIC_ACCOUNTS);
         $("selectedCount").textContent = `${accounts.length} 個${estimatedBatches > 1 ? `（預計 ${estimatedBatches} 批以上）` : ""}`;
         $("grossRent").textContent = formatSol(gross);
         $("storageFee").textContent = formatSol(storageFee);
+        $("coldWalletActivation").textContent = state.coldWalletReady
+          ? (coldWalletActivation ? formatSol(coldWalletActivation) : "已啟用・0 SOL")
+          : "檢查中";
         $("reserve").textContent = `${formatSol(reserve)}${state.reserveReady ? "" : "（保守估算）"}`;
         const estimate = state.swapEstimate;
         const estimateMatches = estimate?.mint === token.value && estimate?.inputLamports === swap;
@@ -413,7 +418,7 @@
         const accounts = selectedAccounts();
         const gross = accounts.reduce((sum, item) => sum + item.lamports, 0);
         const storageFee = Math.floor(gross * STORAGE_FEE_BPS / 10_000);
-        const inputLamports = Math.max(0, gross - storageFee - state.swapReserveLamports);
+        const inputLamports = Math.max(0, gross - storageFee - state.coldWalletActivationLamports - state.swapReserveLamports);
         const token = selectedToken();
         if (state.busy || !state.publicKey || inputLamports <= 0) return;
         const requestId = ++estimateRequestId;
@@ -457,19 +462,27 @@
             [state.publicKey.toBuffer(), tokenProgram.toBuffer(), mint.toBuffer()],
             ASSOCIATED_TOKEN_PROGRAM_ID
           );
-          const [tokenRent, destinationInfo] = await Promise.all([
+          const [tokenRent, destinationInfo, coldWalletInfo, coldWalletMinimum] = await Promise.all([
             connection.getMinimumBalanceForRentExemption(TOKEN_ACCOUNT_SIZE),
-            connection.getAccountInfo(destinationAta, "confirmed")
+            connection.getAccountInfo(destinationAta, "confirmed"),
+            connection.getAccountInfo(COLD_WALLET, "confirmed"),
+            connection.getMinimumBalanceForRentExemption(0)
           ]);
           // 臨時 WSOL 帳戶租金須先墊付；目標 ATA 不存在時還需另一份租金。
           state.swapReserveLamports = tokenRent + (destinationInfo ? 0 : tokenRent) + TRANSACTION_FEE_BUFFER_LAMPORTS;
+          state.coldWalletActivationLamports = Math.max(0, coldWalletMinimum - Number(coldWalletInfo?.lamports || 0));
+          state.coldWalletReady = true;
           state.reserveReady = true;
           updateSummary();
           log(`${selectedToken().dataset.symbol} 兌換預留已更新：${formatSol(state.swapReserveLamports)}${destinationInfo ? "（收幣帳戶已存在）" : "（包含建立收幣帳戶）"}。`);
+          if (state.coldWalletActivationLamports) {
+            log(`公開冷錢包尚未啟用，本次需另補 ${formatSol(state.coldWalletActivationLamports)} 至 Solana 最低門檻；這不是 1% 平台費，啟用後不再收取。`, "warn");
+          }
           scheduleSwapEstimate();
         } catch (error) {
           state.swapReserveLamports = 5_000_000;
           state.reserveReady = false;
+          state.coldWalletReady = false;
           updateSummary();
           log(`無法取得即時帳戶租金，改用保守預留：${walletErrorMessage(error)}`, "warn");
         }
@@ -649,6 +662,8 @@
         state.reserveReady = false;
         state.swapReserveLamports = 5_000_000;
         state.reserveMint = "";
+        state.coldWalletActivationLamports = 0;
+        state.coldWalletReady = false;
         $("walletSelect").disabled = false;
         $("connectBtn").textContent = "連接錢包";
         $("connectBtn").classList.remove("hidden");
@@ -839,11 +854,12 @@
       async function buildAndSendSwap(connection, grossLamports, accounts, carriedLamports = 0, batchLabel = "") {
         const feeLamports = Math.floor(grossLamports * STORAGE_FEE_BPS / 10_000);
         await refreshSwapRequirements(connection);
+        const coldWalletActivationLamports = state.coldWalletActivationLamports;
         const availableLamports = grossLamports + carriedLamports;
-        const swapLamports = availableLamports - feeLamports - state.swapReserveLamports;
+        const swapLamports = availableLamports - feeLamports - coldWalletActivationLamports - state.swapReserveLamports;
         if (swapLamports <= 0) {
-          const shortage = Math.max(0, state.swapReserveLamports + feeLamports + 1 - availableLamports);
-          throw new Error(`第一批回收金額不足以建立兌換所需帳戶。還需多回收約 ${formatSol(shortage)}；請多選幾個空帳戶後再執行。`);
+          const shortage = Math.max(0, state.swapReserveLamports + feeLamports + coldWalletActivationLamports + 1 - availableLamports);
+          throw new Error(`第一批回收金額不足以完成冷錢包啟用與兌換。還需多回收約 ${formatSol(shortage)}；請多選幾個空帳戶後再執行。`);
         }
 
         const token = selectedToken();
@@ -865,7 +881,7 @@
         const transferFee = SystemProgram.transfer({
           fromPubkey: state.publicKey,
           toPubkey: COLD_WALLET,
-          lamports: feeLamports
+          lamports: feeLamports + coldWalletActivationLamports
         });
         const instructions = [
           ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
@@ -929,8 +945,8 @@
         }
 
         const confirmationText = accounts.length
-          ? `回收 ${accounts.length} 個帳戶、永久庫存費 ${formatSol(feeLamports)}，並兌換為 ${token.dataset.symbol}`
-          : `將已回收 SOL 扣除永久庫存費 ${formatSol(feeLamports)} 後兌換為 ${token.dataset.symbol}`;
+          ? `回收 ${accounts.length} 個帳戶、永久庫存費 ${formatSol(feeLamports)}${coldWalletActivationLamports ? `、冷錢包首次啟用 ${formatSol(coldWalletActivationLamports)}` : ""}，並兌換為 ${token.dataset.symbol}`
+          : `將已回收 SOL 扣除永久庫存費 ${formatSol(feeLamports)}${coldWalletActivationLamports ? ` 與冷錢包首次啟用 ${formatSol(coldWalletActivationLamports)}` : ""} 後兌換為 ${token.dataset.symbol}`;
         log(`請確認${batchLabel ? `${batchLabel}：` : "交易："}${confirmationText}…`, "warn");
         const signature = await sendWithConnectedWallet(connection, transaction);
         logTransaction("兌換交易已送出", signature);
@@ -946,11 +962,13 @@
         const grossLamports = accounts.reduce((sum, item) => sum + item.lamports, 0);
         const token = selectedToken();
         const feeLamports = Math.floor(grossLamports * STORAGE_FEE_BPS / 10_000);
+        const coldWalletActivationLamports = state.coldWalletActivationLamports;
         const estimatedBatches = Math.ceil(accounts.length / MAX_ATOMIC_ACCOUNTS);
         const confirmed = window.confirm(
           `即將關閉 ${accounts.length} 個零餘額帳戶並直接兌換，預計分成 ${estimatedBatches} 批以上。\n\n` +
           `預估回收：${formatSol(grossLamports)}\n` +
           `永久庫存費：${formatSol(feeLamports)}（1%）\n` +
+          `${coldWalletActivationLamports ? `冷錢包首次啟用：${formatSol(coldWalletActivationLamports)}（一次性）\n` : ""}` +
           `兌換目標：${token.dataset.symbol}\n\n` +
           `每批通常確認一次；若遇到鏈上租金限制，系統會自動改用兩次確認完成。已完成的批次不會因後續取消而復原。永久庫存費將匯至公開冷錢包，目前不代表已燃燒。是否繼續？`
         );
@@ -1064,5 +1082,3 @@
   </script>
 </body>
 </html>
-
-
