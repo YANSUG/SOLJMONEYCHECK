@@ -58,6 +58,10 @@
     .token-name { font-weight: 850; }
     .address { margin-top: 5px; color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
     .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .wallet-picker { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-bottom: 10px; }
+    .wallet-select { min-width: 0; min-height: 50px; padding: 0 42px 0 15px; border: 1px solid var(--line); border-radius: 15px; color: var(--text); background: var(--panel-2); cursor: pointer; }
+    .wallet-select:focus-visible { outline: 3px solid rgba(92, 242, 165, .4); outline-offset: 2px; }
+    .wallet-hint { align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
     .btn { min-height: 50px; padding: 0 18px; border-radius: 15px; cursor: pointer; font-weight: 850; transition: transform .15s ease, opacity .15s ease, background .15s ease; }
     .btn:hover:not(:disabled) { transform: translateY(-1px); }
     .btn:active:not(:disabled) { transform: translateY(0); }
@@ -98,7 +102,8 @@
     footer { padding-top: 18px; color: #61766b; text-align: center; font-size: 11px; }
     @media (max-width: 620px) {
       .page { padding-top: 25px; }
-      .token-grid, .actions { grid-template-columns: 1fr; }
+      .token-grid, .actions, .wallet-picker { grid-template-columns: 1fr; }
+      .wallet-hint { display: none; }
       .section { padding: 18px; }
       .account { grid-template-columns: auto 1fr; }
       .rent { grid-column: 2; }
@@ -130,8 +135,18 @@
 
       <section class="section">
         <div class="section-title"><h2>連接並掃描錢包</h2><span class="step">02</span></div>
+        <div class="wallet-picker">
+          <select class="wallet-select" id="walletSelect" aria-label="選擇 Solana 錢包">
+            <option value="auto">自動偵測已安裝錢包</option>
+            <option value="phantom">Phantom</option>
+            <option value="solflare">Solflare</option>
+            <option value="backpack">Backpack</option>
+            <option value="okx">OKX Wallet（Web3）</option>
+          </select>
+          <span class="wallet-hint">支援桌面擴充錢包</span>
+        </div>
         <div class="actions">
-          <button class="btn btn-primary" id="connectBtn" type="button">連接 Phantom</button>
+          <button class="btn btn-primary" id="connectBtn" type="button">連接錢包</button>
           <button class="btn btn-secondary" id="scanBtn" type="button" disabled>掃描空帳戶</button>
         </div>
         <div class="wallet" id="walletStatus" aria-live="polite"></div>
@@ -167,7 +182,7 @@
         </details>
       </section>
     </article>
-    <footer>鏈上交易不可逆。請在 Phantom 中再次核對每筆指令與金額。</footer>
+    <footer>鏈上交易不可逆。請在所選錢包中再次核對每筆指令與金額。</footer>
   </main>
 
   <script>
@@ -185,7 +200,7 @@
       const SWAP_RESERVE_LAMPORTS = 3_000_000;
       const CLOSE_BATCH_SIZE = 8;
 
-      const state = { wallet: null, publicKey: null, accounts: [], busy: false };
+      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false };
       const $ = (id) => document.getElementById(id);
       const formatSol = (lamports) => `${(Number(lamports) / 1e9).toFixed(6)} SOL`;
       const shorten = (value, left = 6, right = 5) => `${value.slice(0, left)}…${value.slice(-right)}`;
@@ -255,19 +270,51 @@
         updateSummary();
       }
 
+      function installedWallets() {
+        const phantom = window.phantom?.solana || (window.solana?.isPhantom ? window.solana : null);
+        const solflare = window.solflare?.isSolflare
+          ? window.solflare
+          : (window.solana?.isSolflare ? window.solana : null);
+        const backpackCandidate = window.backpack?.solana || window.backpack;
+        const backpack = backpackCandidate?.isBackpack
+          ? backpackCandidate
+          : (window.solana?.isBackpack ? window.solana : null);
+        const okx = window.okxwallet?.solana || null;
+        return {
+          phantom: phantom?.connect ? { name: "Phantom", provider: phantom } : null,
+          solflare: solflare?.connect ? { name: "Solflare", provider: solflare } : null,
+          backpack: backpack?.connect ? { name: "Backpack", provider: backpack } : null,
+          okx: okx?.connect ? { name: "OKX Wallet", provider: okx } : null
+        };
+      }
+
+      function chooseWallet() {
+        const wallets = installedWallets();
+        const selected = $("walletSelect").value;
+        if (selected !== "auto") return wallets[selected];
+        return wallets.phantom || wallets.solflare || wallets.backpack || wallets.okx;
+      }
+
       async function connectWallet() {
-        if (!window.solana?.isPhantom) {
-          window.open("https://phantom.app/", "_blank", "noopener,noreferrer");
-          throw new Error("找不到 Phantom。請先安裝或開啟 Phantom 錢包。");
+        const chosen = chooseWallet();
+        if (!chosen) {
+          const requested = $("walletSelect").selectedOptions[0].textContent;
+          throw new Error(`找不到「${requested}」。請先安裝 Phantom、Solflare、Backpack 或 OKX Wallet 的瀏覽器錢包。`);
         }
-        const response = await window.solana.connect();
-        state.wallet = window.solana;
-        state.publicKey = response.publicKey;
-        $("walletStatus").textContent = `已連接 ${state.publicKey.toBase58()}`;
+        const response = await chosen.provider.connect();
+        const publicKey = response?.publicKey || chosen.provider.publicKey;
+        if (!publicKey) throw new Error(`${chosen.name} 沒有提供錢包地址。`);
+        state.wallet = chosen.provider;
+        state.walletName = chosen.name;
+        state.publicKey = publicKey;
+        $("walletStatus").textContent = `${chosen.name} 已連接 ${state.publicKey.toBase58()}`;
         $("walletStatus").classList.add("show");
-        $("connectBtn").textContent = "Phantom 已連接";
+        $("connectBtn").textContent = `${chosen.name} 已連接`;
+        $("walletSelect").disabled = true;
         $("scanBtn").disabled = false;
-        log("錢包連接成功。", "ok");
+        chosen.provider.on?.("accountChanged", () => window.location.reload());
+        chosen.provider.on?.("disconnect", () => window.location.reload());
+        log(`${chosen.name} 連接成功。`, "ok");
       }
 
       async function scanAccounts() {
@@ -468,10 +515,10 @@
         const open = notice.classList.toggle("show");
         $("feeInfoBtn").setAttribute("aria-expanded", String(open));
       });
-      window.solana?.on?.("accountChanged", () => window.location.reload());
       updateSummary();
     })();
   </script>
 </body>
 </html>
+
 
