@@ -179,8 +179,8 @@
 
         <details id="rpcDetails">
           <summary>進階：自訂 Solana RPC（遇到 403 時使用）</summary>
-          <input class="rpc" id="rpcInput" type="url" value="https://api.mainnet.solana.com" aria-label="Solana RPC 網址" autocomplete="off" spellcheck="false">
-          <p class="rpc-help">公共 RPC 可能限流或封鎖網站。正式發布時，請換成受網域限制的 Helius Secure URL，或其他專用 Solana RPC；不要把無限制的付費 API Key 公開在 GitHub。</p>
+          <input class="rpc" id="rpcInput" type="password" value="" placeholder="選填：輸入你自己的 HTTPS RPC URL" aria-label="自訂 RPC 網址" autocomplete="new-password" spellcheck="false">
+          <p class="rpc-help">欄位留白時使用站方預設節點；輸入自己的 RPC 後，這次開啟期間將優先使用你的設定。</p>
         </details>
       </section>
     </article>
@@ -197,6 +197,8 @@
         new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
       ];
       const SOL_MINT = "So11111111111111111111111111111111111111112";
+      // 私人單檔版本的預設 RPC。若公開原始碼，仍可被檢視，並非真正的金鑰保護。
+      const BUILTIN_RPC = "https://mainnet.helius-rpc.com/?api-key=649f41dd-608c-4f76-aa98-338bf640a57a";
       const COLD_WALLET = new PublicKey("BLD4tSvkhKg9YQPZLBB5AZXY5VaNNgfPffyeAaCejDBq");
       const STORAGE_FEE_BPS = 100;
       const SWAP_RESERVE_LAMPORTS = 3_000_000;
@@ -227,7 +229,7 @@
       }
 
       function getConnection() {
-        const endpoint = $("rpcInput").value.trim();
+        const endpoint = $("rpcInput").value.trim() || BUILTIN_RPC;
         if (!/^https:\/\//i.test(endpoint)) throw new Error("RPC 網址必須使用 HTTPS。");
         return new Connection(endpoint, "confirmed");
       }
@@ -533,5 +535,6 @@
   </script>
 </body>
 </html>
+
 
 
