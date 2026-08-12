@@ -515,6 +515,10 @@
             </span>
             <span class="rent">+${formatSol(account.lamports)}</span>`;
           row.querySelector("input").addEventListener("change", () => {
+            if (!state.busy && state.rentSafetyLamports) {
+              state.swapReserveLamports = Math.max(0, state.swapReserveLamports - state.rentSafetyLamports);
+              state.rentSafetyLamports = 0;
+            }
             updateSummary();
             scheduleSwapEstimate();
           });
@@ -709,6 +713,7 @@
             if (info?.tokenAmount?.amount === "0" && entry.account.lamports > 0) {
               const extensions = Array.isArray(info.extensions) ? info.extensions : [];
               const transferFeeAmount = extensions.find((extension) => extension?.extension === "transferFeeAmount");
+              const withheldFeeRaw = String(transferFeeAmount?.state?.withheldAmount ?? transferFeeAmount?.withheldAmount ?? "0");
               state.accounts.push({
                 pubkey: entry.pubkey.toBase58(),
                 mint: info.mint,
@@ -716,7 +721,8 @@
                 programId,
                 programLabel: programIndex === 0 ? "Token" : "Token-2022",
                 hasTransferFeeAmount: Boolean(transferFeeAmount),
-                withheldFeeRaw: String(transferFeeAmount?.state?.withheldAmount ?? transferFeeAmount?.withheldAmount ?? "0")
+                withheldFeeRaw,
+                needsWithheldHarvest: Boolean(transferFeeAmount) && BigInt(withheldFeeRaw) > 0n
               });
             }
           }
@@ -725,8 +731,8 @@
           renderAccounts();
           const partial = settled.some((result) => !result.ok);
           log(`掃描完成：找到 ${state.accounts.length} 個可回收帳戶${partial ? "（部分類型暫時無法讀取）" : ""}。`, partial ? "warn" : "ok");
-          const transferFeeAccounts = state.accounts.filter((account) => account.hasTransferFeeAmount).length;
-          if (transferFeeAccounts) log(`其中 ${transferFeeAccounts} 個 Token-2022 帳戶含轉帳費擴充，關閉前會自動歸集代扣費。`, "warn");
+          const transferFeeAccounts = state.accounts.filter((account) => account.needsWithheldHarvest).length;
+          if (transferFeeAccounts) log(`其中 ${transferFeeAccounts} 個 Token-2022 帳戶仍有代扣轉帳費，關閉前會自動歸集。`, "warn");
         } catch (error) {
           const message = String(error?.message || error);
           if (/403|access forbidden|request blocked/i.test(message)) {
@@ -762,7 +768,7 @@
       function harvestWithheldFeeInstructions(accounts) {
         const byMint = new Map();
         accounts
-          .filter((account) => account.hasTransferFeeAmount && account.programId.equals(TOKEN_PROGRAMS[1]))
+          .filter((account) => account.needsWithheldHarvest && account.programId.equals(TOKEN_PROGRAMS[1]))
           .forEach((account) => {
             if (!byMint.has(account.mint)) byMint.set(account.mint, []);
             byMint.get(account.mint).push(account);
@@ -940,6 +946,11 @@
       async function execute() {
         const accounts = selectedAccounts();
         if (!accounts.length || state.busy) return;
+        if (state.rentSafetyLamports) {
+          state.swapReserveLamports = Math.max(0, state.swapReserveLamports - state.rentSafetyLamports);
+          state.rentSafetyLamports = 0;
+          state.swapEstimate = null;
+        }
         const grossLamports = accounts.reduce((sum, item) => sum + item.lamports, 0);
         const token = selectedToken();
         const feeLamports = Math.floor(grossLamports * STORAGE_FEE_BPS / 10_000);
@@ -994,9 +1005,9 @@
                   throw new Error(`已自動提高租金預留 ${MAX_RENT_RETRIES} 次，這條路線仍需要更多 SOL。請多勾選幾個空帳戶，或先在錢包保留少量 SOL 後重試。`);
                 }
                 if (error?.code === "NEEDS_WITHHELD_HARVEST") {
-                  const unmarked = batch.filter((account) => account.programId.equals(TOKEN_PROGRAMS[1]) && !account.hasTransferFeeAmount);
+                  const unmarked = batch.filter((account) => account.programId.equals(TOKEN_PROGRAMS[1]) && !account.needsWithheldHarvest);
                   if (unmarked.length) {
-                    unmarked.forEach((account) => { account.hasTransferFeeAmount = true; });
+                    unmarked.forEach((account) => { account.needsWithheldHarvest = true; });
                     log(`已辨識 ${unmarked.length} 個含代扣費的 Token-2022 帳戶，正在自動加入歸集步驟。`, "warn");
                     continue;
                   }
