@@ -145,6 +145,10 @@
             <span class="token-box"><span class="coin dog">10K</span><span><span class="token-name">10K DOG</span><span class="address">C9HwNW…3pump</span></span></span>
           </label>
         </div>
+        <div class="notice show" id="jmoneyWarning" role="alert">
+          <strong>⚠ JMONEY 防誤操作</strong><br>
+          正式 CA：HZNnmhAY6xfq2iKRyBTEvTVeoTYJzpkK8mfnfG8Ppump。執行前必須再次輸入「JMONEY」確認。系統只會關閉鏈上餘額為 0 的代幣帳戶；關閉空帳戶是回收 SOL 租金，不是燃燒其中的代幣。
+        </div>
       </section>
 
       <section class="section">
@@ -212,6 +216,7 @@
         new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
       ];
       const SOL_MINT = "So11111111111111111111111111111111111111112";
+      const JMONEY_MINT = "HZNnmhAY6xfq2iKRyBTEvTVeoTYJzpkK8mfnfG8Ppump";
       // 私人單檔版本的預設 RPC。若公開原始碼，仍可被檢視，並非真正的金鑰保護。
       const BUILTIN_RPC = "https://mainnet.helius-rpc.com/?api-key=649f41dd-608c-4f76-aa98-338bf640a57a";
       const COLD_WALLET = new PublicKey("BLD4tSvkhKg9YQPZLBB5AZXY5VaNNgfPffyeAaCejDBq");
@@ -961,6 +966,21 @@
         if (!accounts.length || state.busy) return;
         const grossLamports = accounts.reduce((sum, item) => sum + item.lamports, 0);
         const token = selectedToken();
+        if (token.value === JMONEY_MINT) {
+          const includesJmoneyAccount = accounts.some((account) => account.mint === JMONEY_MINT);
+          const typed = window.prompt(
+            `JMONEY 防誤操作確認\n\n` +
+            `正式 CA：${JMONEY_MINT}\n` +
+            `${includesJmoneyAccount ? "你勾選的回收清單中包含 JMONEY 的零餘額代幣帳戶。該帳戶會被關閉後，在需要收幣時重新建立。\n\n" : ""}` +
+            `本功能只關閉代幣餘額為 0 的帳戶並回收 SOL 租金，不會燃燒 JMONEY。\n\n` +
+            `若確認兌換目標是正式 JMONEY，請輸入：JMONEY`
+          );
+          if (typed === null) return;
+          if (typed.trim().toUpperCase() !== "JMONEY") {
+            alert("確認文字不正確，操作已取消。請重新核對 JMONEY 正式 CA。");
+            return;
+          }
+        }
         const feeLamports = Math.floor(grossLamports * STORAGE_FEE_BPS / 10_000);
         const coldWalletActivationLamports = state.coldWalletActivationLamports;
         const estimatedBatches = Math.ceil(accounts.length / MAX_ATOMIC_ACCOUNTS);
@@ -1069,6 +1089,11 @@
       });
       $("executeBtn").addEventListener("click", execute);
       document.querySelectorAll('input[name="target"]').forEach((input) => input.addEventListener("change", async () => {
+        const isJmoney = input.checked && input.value === JMONEY_MINT;
+        $("jmoneyWarning").classList.toggle("show", isJmoney);
+        if (isJmoney) {
+          alert(`JMONEY 防誤操作提醒\n\n請確認正式 CA：\n${JMONEY_MINT}\n\n執行時還會要求輸入 JMONEY 再次確認。`);
+        }
         updateSummary();
         if (state.publicKey) await refreshSwapRequirements();
       }));
@@ -1082,3 +1107,4 @@
   </script>
 </body>
 </html>
+
