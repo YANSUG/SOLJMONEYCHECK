@@ -290,6 +290,24 @@
         return new Connection(endpoint, "confirmed");
       }
 
+      const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+      async function withRetry(task, label, attempts = 3) {
+        let lastError;
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+          try {
+            return await task();
+          } catch (error) {
+            lastError = error;
+            if (attempt < attempts) {
+              log(`${label} 暫時沒有回應，正在重試 ${attempt}/${attempts - 1}…`, "warn");
+              await wait(450 * attempt);
+            }
+          }
+        }
+        throw lastError;
+      }
+
       function updateSummary() {
         const accounts = selectedAccounts();
         const gross = accounts.reduce((sum, item) => sum + item.lamports, 0);
@@ -459,11 +477,27 @@
         log("正在掃描 Token 與 Token-2022 空帳戶…");
         try {
           const connection = getConnection();
-          const responses = await Promise.all(TOKEN_PROGRAMS.map(async (programId, programIndex) => {
-            const result = await connection.getParsedTokenAccountsByOwner(state.publicKey, { programId });
-            return result.value.map((entry) => ({ entry, programId, programIndex }));
-          }));
-          for (const { entry, programId, programIndex } of responses.flat()) {
+          const labels = ["Token", "Token-2022"];
+          const settled = [];
+          for (let programIndex = 0; programIndex < TOKEN_PROGRAMS.length; programIndex++) {
+            const programId = TOKEN_PROGRAMS[programIndex];
+            try {
+              const result = await withRetry(
+                () => connection.getParsedTokenAccountsByOwner(state.publicKey, { programId }),
+                labels[programIndex]
+              );
+              settled.push({ ok: true, entries: result.value.map((entry) => ({ entry, programId, programIndex })) });
+            } catch (error) {
+              settled.push({ ok: false, label: labels[programIndex], error });
+              log(`${labels[programIndex]} 掃描失敗：${walletErrorMessage(error)}`, "warn");
+            }
+          }
+          const successful = settled.filter((result) => result.ok);
+          if (!successful.length) {
+            const reasons = settled.map((result) => `${result.label}: ${walletErrorMessage(result.error)}`).join("；");
+            throw new Error(`RPC 無法完成帳戶查詢。${reasons}`);
+          }
+          for (const { entry, programId, programIndex } of successful.flatMap((result) => result.entries)) {
             const info = entry.account.data.parsed?.info;
             if (info?.tokenAmount?.amount === "0" && entry.account.lamports > 0) {
               state.accounts.push({
@@ -478,7 +512,8 @@
           state.accounts.sort((a, b) => b.lamports - a.lamports);
           await hydrateTokenMetadata(connection.rpcEndpoint);
           renderAccounts();
-          log(`掃描完成：找到 ${state.accounts.length} 個可回收帳戶。`, "ok");
+          const partial = settled.some((result) => !result.ok);
+          log(`掃描完成：找到 ${state.accounts.length} 個可回收帳戶${partial ? "（部分類型暫時無法讀取）" : ""}。`, partial ? "warn" : "ok");
         } catch (error) {
           const message = String(error?.message || error);
           if (/403|access forbidden|request blocked/i.test(message)) {
@@ -488,6 +523,10 @@
           if (/429|too many requests/i.test(message)) {
             $("rpcDetails").open = true;
             throw new Error("Solana RPC 請求過於頻繁（429）。請稍後重試，或換成專用 RPC 網址。");
+          }
+          if (/failed to fetch|fetch failed|522|networkerror|network request failed/i.test(message)) {
+            $("rpcDetails").open = true;
+            throw new Error("RPC 網路連線中斷。已自動重試但仍未成功；請稍後再次掃描，或在下方輸入另一個專用 RPC 網址。若目前以 file:// 開啟，也可上傳 GitHub Pages 後再測試。");
           }
           throw error;
         } finally {
@@ -678,4 +717,5 @@
   </script>
 </body>
 </html>
+
 
