@@ -107,6 +107,7 @@
     .status .ok { color: var(--green); }
     .status .warn { color: var(--amber); }
     .status .bad { color: var(--danger); }
+    .status a { color: var(--green); text-decoration: underline; text-underline-offset: 3px; overflow-wrap: anywhere; }
     details { margin-top: 16px; color: var(--muted); font-size: 12px; }
     details summary { cursor: pointer; }
     .rpc { width: 100%; margin-top: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 11px; color: var(--text); background: #06100c; }
@@ -238,6 +239,49 @@
         line.textContent = `› ${message}`;
         box.appendChild(line);
         box.scrollTop = box.scrollHeight;
+      }
+
+      function logTransaction(label, signature) {
+        const box = $("status");
+        box.classList.add("show");
+        const line = document.createElement("div");
+        line.className = "ok";
+        line.append("› ", `${label}：`);
+        const link = document.createElement("a");
+        link.href = `https://solscan.io/tx/${encodeURIComponent(signature)}`;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = signature;
+        line.appendChild(link);
+        box.appendChild(line);
+        box.scrollTop = box.scrollHeight;
+      }
+
+      function walletErrorMessage(error) {
+        const parts = [error?.message, error?.data?.message, error?.error?.message].filter(Boolean);
+        if (error?.code != null) parts.push(`錯誤代碼 ${error.code}`);
+        return [...new Set(parts)].join("；") || String(error || "未知錯誤");
+      }
+
+      function extractSignature(result) {
+        if (typeof result === "string") return result;
+        return result?.signature || result?.txid || result?.txId || null;
+      }
+
+      async function sendWithConnectedWallet(connection, transaction) {
+        // OKX 對 VersionedTransaction 使用先簽名、再由目前 RPC 廣播最穩定。
+        if (state.walletName === "OKX Wallet") {
+          const signedTransaction = await state.wallet.signTransaction(transaction);
+          if (!signedTransaction?.serialize) throw new Error("OKX Wallet 沒有回傳可廣播的已簽名交易。");
+          return connection.sendRawTransaction(signedTransaction.serialize(), {
+            skipPreflight: false,
+            maxRetries: 3
+          });
+        }
+        const result = await state.wallet.signAndSendTransaction(transaction);
+        const signature = extractSignature(result);
+        if (!signature) throw new Error("錢包已回應，但沒有提供交易簽章；請先查看錢包活動紀錄，避免重複送出。");
+        return signature;
       }
 
       function getConnection() {
@@ -473,9 +517,10 @@
           });
           batch.forEach((account) => transaction.add(closeAccountInstruction(account)));
           log(`請確認回收交易 ${Math.floor(offset / CLOSE_BATCH_SIZE) + 1}/${Math.ceil(accounts.length / CLOSE_BATCH_SIZE)}…`, "warn");
-          const result = await state.wallet.signAndSendTransaction(transaction);
-          await connection.confirmTransaction({ signature: result.signature, ...latest }, "confirmed");
-          log(`已確認回收交易：${shorten(result.signature, 10, 8)}`, "ok");
+          const signature = await sendWithConnectedWallet(connection, transaction);
+          const confirmation = await connection.confirmTransaction({ signature, ...latest }, "confirmed");
+          if (confirmation.value.err) throw new Error(`回收交易執行失敗：${JSON.stringify(confirmation.value.err)}`);
+          logTransaction("已確認回收交易", signature);
         }
       }
 
@@ -566,10 +611,21 @@
         }).compileToV0Message(makeLookupTables(build.addressesByLookupTableAddress));
         const transaction = new VersionedTransaction(message);
 
+        const simulation = await connection.simulateTransaction(transaction, {
+          sigVerify: false,
+          replaceRecentBlockhash: true
+        });
+        if (simulation.value.err) {
+          const usefulLogs = (simulation.value.logs || []).slice(-5).join(" | ");
+          throw new Error(`兌換交易模擬失敗：${JSON.stringify(simulation.value.err)}${usefulLogs ? `；${usefulLogs}` : ""}`);
+        }
+
         log(`請確認永久庫存費 ${formatSol(feeLamports)} 與兌換交易…`, "warn");
-        const result = await state.wallet.signAndSendTransaction(transaction);
-        await connection.confirmTransaction({ signature: result.signature, blockhash: recentBlockhash, lastValidBlockHeight }, "confirmed");
-        log(`兌換完成：${shorten(result.signature, 10, 8)}`, "ok");
+        const signature = await sendWithConnectedWallet(connection, transaction);
+        logTransaction("兌換交易已送出", signature);
+        const confirmation = await connection.confirmTransaction({ signature, blockhash: recentBlockhash, lastValidBlockHeight }, "confirmed");
+        if (confirmation.value.err) throw new Error(`兌換交易鏈上執行失敗：${JSON.stringify(confirmation.value.err)}`);
+        log(`兌換完成，已確認收到 ${token.dataset.symbol}。`, "ok");
       }
 
       async function execute() {
@@ -597,7 +653,7 @@
           await scanAccounts();
         } catch (error) {
           console.error(error);
-          log(error?.message || "交易失敗，請稍後再試。", "bad");
+          log(walletErrorMessage(error), "bad");
           log("若租金回收已確認但兌換未完成，回收的 SOL 仍留在你的錢包中。", "warn");
         } finally {
           setBusy(false);
@@ -622,5 +678,4 @@
   </script>
 </body>
 </html>
-
 
