@@ -221,9 +221,18 @@
       const CLOSE_BATCH_SIZE = 8;
       const MAX_ATOMIC_ACCOUNTS = 4;
 
-      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false, swapReserveLamports: 5_000_000, reserveReady: false };
+      const state = { wallet: null, walletName: "", publicKey: null, accounts: [], busy: false, swapReserveLamports: 5_000_000, reserveReady: false, targetDecimals: 6, swapEstimate: null };
+      let estimateTimer = null;
+      let estimateRequestId = 0;
       const $ = (id) => document.getElementById(id);
       const formatSol = (lamports) => `${(Number(lamports) / 1e9).toFixed(6)} SOL`;
+      const formatTokenAmount = (rawAmount, decimals) => {
+        const raw = BigInt(String(rawAmount || "0"));
+        const scale = 10n ** BigInt(decimals);
+        const whole = raw / scale;
+        const fraction = (raw % scale).toString().padStart(decimals, "0").slice(0, 6).replace(/0+$/, "");
+        return `${whole.toLocaleString("en-US")}${fraction ? `.${fraction}` : ""}`;
+      };
       const shorten = (value, left = 6, right = 5) => `${value.slice(0, left)}…${value.slice(-right)}`;
       const selectedToken = () => document.querySelector('input[name="target"]:checked');
       const selectedAccounts = () => state.accounts.filter((_, i) => document.getElementById(`account-${i}`)?.checked);
@@ -327,8 +336,53 @@
         $("grossRent").textContent = formatSol(gross);
         $("storageFee").textContent = formatSol(storageFee);
         $("reserve").textContent = `${formatSol(reserve)}${state.reserveReady ? "" : "（保守估算）"}`;
-        $("swapAmount").textContent = `${formatSol(swap)} → ${token.dataset.symbol}`;
+        const estimate = state.swapEstimate;
+        const estimateMatches = estimate?.mint === token.value && estimate?.inputLamports === swap;
+        const outputText = estimateMatches && estimate.outAmount
+          ? `約 ${formatTokenAmount(estimate.outAmount, estimate.decimals)} ${token.dataset.symbol}`
+          : (swap > 0 ? `估算中… ${token.dataset.symbol}` : token.dataset.symbol);
+        $("swapAmount").textContent = `${formatSol(swap)} → ${outputText}`;
         $("executeBtn").disabled = state.busy || !state.publicKey || accounts.length === 0 || swap <= 0;
+      }
+
+      function scheduleSwapEstimate() {
+        clearTimeout(estimateTimer);
+        state.swapEstimate = null;
+        updateSummary();
+        if (state.busy || !state.publicKey || !selectedAccounts().length) return;
+        estimateTimer = setTimeout(() => refreshSwapEstimate().catch(() => {}), 350);
+      }
+
+      async function refreshSwapEstimate() {
+        const accounts = selectedAccounts();
+        const gross = accounts.reduce((sum, item) => sum + item.lamports, 0);
+        const storageFee = Math.floor(gross * STORAGE_FEE_BPS / 10_000);
+        const inputLamports = Math.max(0, gross - storageFee - state.swapReserveLamports);
+        const token = selectedToken();
+        if (state.busy || !state.publicKey || inputLamports <= 0) return;
+        const requestId = ++estimateRequestId;
+        const params = new URLSearchParams({
+          inputMint: SOL_MINT,
+          outputMint: token.value,
+          amount: String(inputLamports),
+          taker: state.publicKey.toBase58(),
+          slippageBps: "200",
+          wrapAndUnwrapSol: "true"
+        });
+        try {
+          const response = await fetch(`https://api.jup.ag/swap/v2/build?${params}`);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const build = await response.json();
+          if (requestId !== estimateRequestId) return;
+          if (!build.outAmount) throw new Error(build.error || "No quote");
+          state.swapEstimate = { mint: token.value, inputLamports, outAmount: build.outAmount, decimals: state.targetDecimals };
+        } catch {
+          if (requestId !== estimateRequestId) return;
+          state.swapEstimate = { mint: token.value, inputLamports, outAmount: null, decimals: state.targetDecimals };
+          $("swapAmount").textContent = `${formatSol(inputLamports)} → 暫無報價 ${token.dataset.symbol}`;
+          return;
+        }
+        updateSummary();
       }
 
       async function refreshSwapRequirements(connection = getConnection()) {
@@ -337,6 +391,7 @@
           const mint = new PublicKey(selectedToken().value);
           const mintInfo = await connection.getAccountInfo(mint, "confirmed");
           if (!mintInfo) throw new Error("找不到目標代幣 Mint。");
+          state.targetDecimals = Number(mintInfo.data?.[44] ?? 6);
           const tokenProgram = mintInfo.owner;
           const [destinationAta] = PublicKey.findProgramAddressSync(
             [state.publicKey.toBuffer(), tokenProgram.toBuffer(), mint.toBuffer()],
@@ -351,6 +406,7 @@
           state.reserveReady = true;
           updateSummary();
           log(`${selectedToken().dataset.symbol} 兌換預留已更新：${formatSol(state.swapReserveLamports)}${destinationInfo ? "（收幣帳戶已存在）" : "（包含建立收幣帳戶）"}。`);
+          scheduleSwapEstimate();
         } catch (error) {
           state.swapReserveLamports = 5_000_000;
           state.reserveReady = false;
@@ -395,7 +451,10 @@
               <span class="account-program">${account.programLabel} · ${shorten(account.pubkey, 6, 5)}</span>
             </span>
             <span class="rent">+${formatSol(account.lamports)}</span>`;
-          row.querySelector("input").addEventListener("change", updateSummary);
+          row.querySelector("input").addEventListener("change", () => {
+            updateSummary();
+            scheduleSwapEstimate();
+          });
           row.querySelector(".copy-ca").addEventListener("click", async (event) => {
             const button = event.currentTarget;
             try {
@@ -583,12 +642,16 @@
           for (const { entry, programId, programIndex } of successful.flatMap((result) => result.entries)) {
             const info = entry.account.data.parsed?.info;
             if (info?.tokenAmount?.amount === "0" && entry.account.lamports > 0) {
+              const extensions = Array.isArray(info.extensions) ? info.extensions : [];
+              const transferFeeAmount = extensions.find((extension) => extension?.extension === "transferFeeAmount");
               state.accounts.push({
                 pubkey: entry.pubkey.toBase58(),
                 mint: info.mint,
                 lamports: entry.account.lamports,
                 programId,
-                programLabel: programIndex === 0 ? "Token" : "Token-2022"
+                programLabel: programIndex === 0 ? "Token" : "Token-2022",
+                hasTransferFeeAmount: Boolean(transferFeeAmount),
+                withheldFeeRaw: String(transferFeeAmount?.state?.withheldAmount ?? transferFeeAmount?.withheldAmount ?? "0")
               });
             }
           }
@@ -597,6 +660,8 @@
           renderAccounts();
           const partial = settled.some((result) => !result.ok);
           log(`掃描完成：找到 ${state.accounts.length} 個可回收帳戶${partial ? "（部分類型暫時無法讀取）" : ""}。`, partial ? "warn" : "ok");
+          const transferFeeAccounts = state.accounts.filter((account) => account.hasTransferFeeAmount).length;
+          if (transferFeeAccounts) log(`其中 ${transferFeeAccounts} 個 Token-2022 帳戶含轉帳費擴充，關閉前會自動歸集代扣費。`, "warn");
         } catch (error) {
           const message = String(error?.message || error);
           if (/403|access forbidden|request blocked/i.test(message)) {
@@ -629,6 +694,37 @@
         });
       }
 
+      function harvestWithheldFeeInstructions(accounts) {
+        const byMint = new Map();
+        accounts
+          .filter((account) => account.hasTransferFeeAmount && account.programId.equals(TOKEN_PROGRAMS[1]))
+          .forEach((account) => {
+            if (!byMint.has(account.mint)) byMint.set(account.mint, []);
+            byMint.get(account.mint).push(account);
+          });
+        return [...byMint.entries()].map(([mint, sourceAccounts]) => new TransactionInstruction({
+          programId: TOKEN_PROGRAMS[1],
+          keys: [
+            { pubkey: new PublicKey(mint), isSigner: false, isWritable: true },
+            ...sourceAccounts.map((account) => ({
+              pubkey: new PublicKey(account.pubkey),
+              isSigner: false,
+              isWritable: true
+            }))
+          ],
+          // TokenInstruction::TransferFeeExtension (26),
+          // TransferFeeInstruction::HarvestWithheldTokensToMint (4).
+          data: Uint8Array.from([26, 4])
+        }));
+      }
+
+      function reclaimInstructions(accounts) {
+        return [
+          ...harvestWithheldFeeInstructions(accounts),
+          ...accounts.map(closeAccountInstruction)
+        ];
+      }
+
       async function closeSelectedAccounts(connection, accounts) {
         for (let offset = 0; offset < accounts.length; offset += CLOSE_BATCH_SIZE) {
           const batch = accounts.slice(offset, offset + CLOSE_BATCH_SIZE);
@@ -637,7 +733,7 @@
             feePayer: state.publicKey,
             recentBlockhash: latest.blockhash
           });
-          batch.forEach((account) => transaction.add(closeAccountInstruction(account)));
+          reclaimInstructions(batch).forEach((instruction) => transaction.add(instruction));
           log(`請確認回收交易 ${Math.floor(offset / CLOSE_BATCH_SIZE) + 1}/${Math.ceil(accounts.length / CLOSE_BATCH_SIZE)}…`, "warn");
           const signature = await sendWithConnectedWallet(connection, transaction);
           const confirmation = await connection.confirmTransaction({ signature, ...latest }, "confirmed");
@@ -701,6 +797,9 @@
         if (!response.ok) throw new Error(`Jupiter 報價失敗（${response.status}）：${await response.text()}`);
         const build = await response.json();
         if (!build.swapInstruction) throw new Error(build.error || "Jupiter 沒有回傳可用的兌換路線。");
+        if (build.outAmount) {
+          log(`本批路線預估可收到約 ${formatTokenAmount(build.outAmount, state.targetDecimals)} ${token.dataset.symbol}。`);
+        }
 
         const transferFee = SystemProgram.transfer({
           fromPubkey: state.publicKey,
@@ -710,7 +809,7 @@
         const instructions = [
           ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
           ...(build.computeBudgetInstructions || []).map(toInstruction),
-          ...accounts.map(closeAccountInstruction),
+          ...reclaimInstructions(accounts),
           ...(build.setupInstructions || []).map(toInstruction),
           toInstruction(build.swapInstruction),
           transferFee,
@@ -752,6 +851,11 @@
         });
         if (simulation.value.err) {
           const usefulLogs = (simulation.value.logs || []).slice(-5).join(" | ");
+          if (/withheld fee balance is zero|harvest fees to the mint/i.test(usefulLogs)) {
+            const error = new Error("偵測到 Token-2022 帳戶仍有代扣轉帳費，正在加入歸集指令後重試。");
+            error.code = "NEEDS_WITHHELD_HARVEST";
+            throw error;
+          }
           throw new Error(`兌換交易模擬失敗：${JSON.stringify(simulation.value.err)}${usefulLogs ? `；${usefulLogs}` : ""}`);
         }
 
@@ -808,6 +912,14 @@
                 completedBatches += 1;
                 sent = true;
               } catch (error) {
+                if (error?.code === "NEEDS_WITHHELD_HARVEST") {
+                  const unmarked = batch.filter((account) => account.programId.equals(TOKEN_PROGRAMS[1]) && !account.hasTransferFeeAmount);
+                  if (unmarked.length) {
+                    unmarked.forEach((account) => { account.hasTransferFeeAmount = true; });
+                    log(`已辨識 ${unmarked.length} 個含代扣費的 Token-2022 帳戶，正在自動加入歸集步驟。`, "warn");
+                    continue;
+                  }
+                }
                 if (error?.code === "TX_TOO_LARGE" && batchSize > 1) {
                   batchSize -= 1;
                   log(`本批交易容量過大，已自動縮小為 ${batchSize} 個帳戶後重試，不需重新勾選。`, "warn");
@@ -858,5 +970,6 @@
   </script>
 </body>
 </html>
+
 
 
